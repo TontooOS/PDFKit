@@ -1,0 +1,10 @@
+{
+  "pdfkit.app.title": "PDFKit",
+  "pdfkit.app.description": "Nativer PDF-Betrachter fuer TontooOS",
+  "pdfkit.view.empty": "Kein Dokument geladen",
+  "pdfkit.view.page": "Seite {} von {}",
+  "pdfkit.view.zoom_in": "Vergroessern",
+  "pdfkit.view.zoom_out": "Verkleinern",
+  "pdfkit.error.load_failed": "PDF konnte nicht geoeffnet werden: '{}'",
+  "pdfkit.error.no_text": "Diese Seite enthaelt noch keinen Text"
+}

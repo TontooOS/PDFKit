@@ -1,0 +1,10 @@
+{
+  "pdfkit.app.title": "PDFKit",
+  "pdfkit.app.description": "Native PDF viewer for TontooOS",
+  "pdfkit.view.empty": "No document loaded",
+  "pdfkit.view.page": "Page {} of {}",
+  "pdfkit.view.zoom_in": "Zoom in",
+  "pdfkit.view.zoom_out": "Zoom out",
+  "pdfkit.error.load_failed": "Could not open PDF: '{}'",
+  "pdfkit.error.no_text": "This page contains no text yet"
+}

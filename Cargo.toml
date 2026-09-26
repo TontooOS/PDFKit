@@ -1,0 +1,21 @@
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[package]
+name = "pdfkit"
+version = "26.1.0"
+edition = "2021"
+authors = ["arlomu"]
+description = "Native PDF document model and TontooUI viewer for TontooOS"
+license = "TCL"
+repository = "https://github.com/TontooOS/PDFKit"
+keywords = ["tontoo", "pdf", "viewer", "vello"]
+categories = ["gui", "parser-implementations"]
+
+[dependencies]
+flate2 = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tontooui = { package = "tontooui", path = "../TontooUI" }
+vello = "0.10"
+parley = "0.11"
