@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::annot::{DocInfo, LinkTarget, Outline, parse_annotation, parse_info, parse_outlines, pdfdoc_to_string};
 use crate::color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 use crate::error::{PdfError, Result};
 use crate::font::{DecoderKind, FontDecoder, apply_differences, parse_cmap};
@@ -20,6 +21,8 @@ use crate::parser::FileParser;
 #[derive(Debug)]
 pub struct PdfDocument {
   pages: Vec<PdfPage>,
+  outlines: Vec<Outline>,
+  info: DocInfo,
 }
 
 impl PdfDocument {
@@ -37,6 +40,12 @@ impl PdfDocument {
 
   fn from_parser(parser: &FileParser) -> Result<Self> {
     let parsed = parser.pages()?;
+    let page_of: HashMap<u32, usize> = parsed.iter().map(|p| (p.objnum, p.index)).collect();
+    let names = collect_names(parser);
+    let resolve_page = |v: &PdfValue| match v {
+      PdfValue::Ref(n, _) => page_of.get(n).copied(),
+      _ => None,
+    };
     let mut pages = Vec::with_capacity(parsed.len());
     for item in &parsed {
       let builder = FontBuilder { parser };
@@ -50,6 +59,12 @@ impl PdfDocument {
       let runs = text_runs(&items);
       let width = (item.media_box[2] - item.media_box[0]).max(1.0);
       let height = (item.media_box[3] - item.media_box[1]).max(1.0);
+      let annotations = item
+        .annots
+        .iter()
+        .filter_map(|a| parser.resolve_value(a).ok())
+        .filter_map(|d| parse_annotation(&d, &resolve_page))
+        .collect();
       pages.push(PdfPage {
         number: item.index,
         width,
@@ -58,12 +73,34 @@ impl PdfDocument {
         origin_y: item.media_box[1],
         runs,
         items,
+        annotations,
       });
     }
     if pages.is_empty() {
       return Err(PdfError::NoPages);
     }
-    Ok(Self { pages })
+    let outlines = parser
+      .catalog()
+      .ok()
+      .and_then(|catalog| catalog.get("Outlines").cloned())
+      .and_then(|o| parser.resolve_value(&o).ok())
+      .map(|outlines| {
+        parse_outlines(
+          &outlines,
+          &|v| parser.resolve_value(v).ok(),
+          &|v| resolve_dest(parser, &names, &page_of, v).and_then(|t| match t {
+            LinkTarget::Page(i) => Some(i),
+            _ => None,
+          }),
+        )
+      })
+      .unwrap_or_default();
+    let outlines = outlines
+      .into_iter()
+      .map(|o| resolve_outline(parser, &names, &page_of, o))
+      .collect();
+    let info = parser.info_dict().and_then(|d| parser.resolve_value(&d).ok()).map(|d| parse_info(&d)).unwrap_or_default();
+    Ok(Self { pages, outlines, info })
   }
 
   /// Number of pages in the document.
@@ -80,6 +117,121 @@ impl PdfDocument {
   /// True when the document has no text on any page.
   pub fn is_empty_text(&self) -> bool {
     self.pages.iter().all(|p| p.runs.is_empty())
+  }
+
+  /// Bookmark outlines with resolved page targets.
+  pub fn outlines(&self) -> &[Outline] {
+    &self.outlines
+  }
+
+  /// Document metadata from the trailer `/Info` dict.
+  pub fn info(&self) -> &DocInfo {
+    &self.info
+  }
+}
+
+/// Collect named destinations (`/Names /Dests` tree plus old-style
+/// catalog `/Dests`) into a flat map.
+fn collect_names(parser: &FileParser) -> HashMap<String, PdfValue> {
+  let mut out = HashMap::new();
+  let catalog = match parser.catalog() {
+    Ok(catalog) => catalog,
+    Err(_) => return out,
+  };
+  if let Some(dests) = catalog.get("Dests").and_then(|v| parser.resolve_value(v).ok()) {
+    if let PdfValue::Dict(entries) = &dests {
+      for (name, value) in entries {
+        out.insert(name.clone(), value.clone());
+      }
+    }
+  }
+  if let Some(names) = catalog.get("Names").and_then(|v| parser.resolve_value(v).ok()) {
+    if let Some(tree) = names.get("Dests").and_then(|v| parser.resolve_value(v).ok()) {
+      collect_tree(parser, &tree, &mut out);
+    }
+  }
+  out
+}
+
+fn collect_tree(parser: &FileParser, node: &PdfValue, out: &mut HashMap<String, PdfValue>) {
+  if let Some(items) = node.get("Names").and_then(|v| v.as_array()) {
+    for pair in items.chunks(2) {
+      if pair.len() == 2 {
+        let key = match &pair[0] {
+          PdfValue::Str(bytes) | PdfValue::Hex(bytes) => pdfdoc_to_string(bytes),
+          PdfValue::Name(n) => n.clone(),
+          _ => continue,
+        };
+        out.insert(key, pair[1].clone());
+      }
+    }
+  }
+  if let Some(kids) = node.get("Kids").and_then(|v| v.as_array()) {
+    for kid in kids {
+      if let Ok(resolved) = parser.resolve_value(kid) {
+        collect_tree(parser, &resolved, out);
+      }
+    }
+  }
+}
+
+/// Resolve a destination value to a link target.
+fn resolve_dest(parser: &FileParser, names: &HashMap<String, PdfValue>, page_of: &HashMap<u32, usize>, dest: &PdfValue) -> Option<LinkTarget> {
+  match dest {
+    PdfValue::Ref(n, _) => match page_of.get(n) {
+      Some(index) => Some(LinkTarget::Page(*index)),
+      None => {
+        let resolved = parser.resolve_value(dest).ok()?;
+        resolve_dest(parser, names, page_of, &resolved)
+      }
+    },
+    PdfValue::Name(n) => match names.get(n) {
+      Some(mapped) => resolve_dest(parser, names, page_of, mapped),
+      None => {
+        if let Ok(page) = n.parse::<usize>() {
+          Some(LinkTarget::Page(page))
+        } else {
+          Some(LinkTarget::Named(n.clone()))
+        }
+      }
+    },
+    PdfValue::Str(bytes) | PdfValue::Hex(bytes) => {
+      let name = pdfdoc_to_string(bytes);
+      match names.get(&name) {
+        Some(mapped) => resolve_dest(parser, names, page_of, mapped),
+        None => {
+          if let Ok(page) = name.parse::<usize>() {
+            Some(LinkTarget::Page(page))
+          } else {
+            Some(LinkTarget::Named(name))
+          }
+        }
+      }
+    }
+    PdfValue::Array(items) => match items.first() {
+      Some(PdfValue::Ref(n, _)) => page_of.get(n).copied().map(LinkTarget::Page),
+      Some(first) if first.as_number().is_some() => Some(LinkTarget::Page(first.as_number().unwrap_or(0.0) as usize)),
+      _ => None,
+    },
+    _ => None,
+  }
+}
+
+fn resolve_outline(parser: &FileParser, names: &HashMap<String, PdfValue>, page_of: &HashMap<u32, usize>, item: Outline) -> Outline {
+  let target = item.target.and_then(|t| match t {
+    LinkTarget::Named(n) => {
+      let key = PdfValue::Name(n);
+      resolve_dest(parser, names, page_of, &key).or(Some(LinkTarget::Named(match &key {
+        PdfValue::Name(s) => s.clone(),
+        _ => String::new(),
+      })))
+    }
+    other => Some(other),
+  });
+  Outline {
+    target,
+    children: item.children.into_iter().map(|c| resolve_outline(parser, names, page_of, c)).collect(),
+    ..item
   }
 }
 
@@ -897,6 +1049,15 @@ mod tests {
   }
 
   fn assemble(objects: Vec<Vec<u8>>) -> PdfDocument {
+    assemble_with_info(objects, None)
+  }
+
+  fn assemble_with_info(objects: Vec<Vec<u8>>, info: Option<Vec<u8>>) -> PdfDocument {
+    let mut objects = objects;
+    let info_ref = info.map(|body| {
+      objects.push(body);
+      objects.len() as u32
+    });
     let mut pdf = b"%PDF-1.4\n".to_vec();
     let mut offsets = Vec::new();
     for (i, body) in objects.iter().enumerate() {
@@ -911,10 +1072,45 @@ mod tests {
     for off in &offsets {
       pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
     }
-    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n", objects.len() + 1).as_bytes());
+    let mut trailer = format!("<< /Size {} /Root 1 0 R", objects.len() + 1);
+    if let Some(num) = info_ref {
+      trailer.push_str(&format!(" /Info {num} 0 R"));
+    }
+    trailer.push_str(" >>");
+    pdf.extend_from_slice(b"trailer\n");
+    pdf.extend_from_slice(trailer.as_bytes());
+    pdf.extend_from_slice(b"\nstartxref\n");
     pdf.extend_from_slice(xref.to_string().as_bytes());
     pdf.extend_from_slice(b"\n%%EOF");
     PdfDocument::load_bytes(pdf).unwrap()
+  }
+
+  #[test]
+  fn annotations_outlines_info() {
+    let content = b"BT /F1 12 Tf (Body) Tj ET";
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R /Outlines 8 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> /Annots [6 0 R 7 0 R] >>".to_vec(),
+      [b"<< /Length ".to_vec(), content.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), content.to_vec(), b"\nendstream".to_vec()].concat(),
+      b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+      b"<< /Type /Annot /Subtype /Link /Rect [0 0 100 20] /Border [0 0 1] /A << /S /URI /URI (https://tontoo.os) >> >>".to_vec(),
+      b"<< /Type /Annot /Subtype /Highlight /Rect [0 0 50 10] /C [1 1 0] /QuadPoints [0 10 50 10 50 0 0 0] >>".to_vec(),
+      b"<< /First 9 0 R /Last 9 0 R /Count 1 >>".to_vec(),
+      b"<< /Title (Chapter) /Parent 8 0 R /Dest [3 0 R /Fit] >>".to_vec(),
+    ];
+    let doc = assemble_with_info(objects, Some(b"<< /Title (Doc) /Author (Me) >>".to_vec()));
+    let page = doc.page(0).unwrap();
+    assert_eq!(page.annotations.len(), 2);
+    let link = page.annotations.iter().find(|a| a.subtype == "Link").unwrap();
+    assert_eq!(link.target, Some(crate::annot::LinkTarget::Uri("https://tontoo.os".into())));
+    let mark = page.annotations.iter().find(|a| a.subtype == "Highlight").unwrap();
+    assert_eq!(mark.quads.len(), 1);
+    assert_eq!(doc.outlines.len(), 1);
+    assert_eq!(doc.outlines[0].title, "Chapter");
+    assert_eq!(doc.outlines[0].target, Some(crate::annot::LinkTarget::Page(0)));
+    assert_eq!(doc.info.title.as_deref(), Some("Doc"));
+    assert_eq!(doc.info.author.as_deref(), Some("Me"));
   }
 
   #[test]

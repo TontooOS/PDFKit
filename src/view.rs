@@ -279,11 +279,127 @@ impl PdfView {
         }
         // Tiling patterns render later; skipped items stay silent.
         PageItem::Pattern(_) | PageItem::Skipped(_) => {}
+        // Structure markers need no paint.
+        PageItem::BeginMarked(_) | PageItem::EndMarked => {}
       }
     }
     while clip_depth > 0 {
       scene.pop_layer();
       clip_depth -= 1;
+    }
+    self.draw_annotations(scene, &page, ox, oy1);
+  }
+
+  fn draw_annotations(&self, scene: &mut Scene, page: &crate::page::PdfPage, ox: f32, oy1: f32) {
+    for annot in &page.annotations {
+      self.paint_annotation(scene, annot, ox, oy1);
+    }
+  }
+
+  fn paint_annotation(&self, scene: &mut Scene, annot: &crate::annot::Annotation, ox: f32, oy1: f32) {
+    let color = annot.color.unwrap_or(Rgb { r: 0.0, g: 0.0, b: 1.0 });
+    let pt = |x: f32, y: f32| {
+      let (px, py) = self.map_point(ox, oy1, x, y);
+      (px as f64, py as f64)
+    };
+    match annot.subtype.as_str() {
+      "Highlight" => {
+        let brush = Brush::Solid(rgba(color, 0.35));
+        if annot.quads.is_empty() {
+          let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
+          let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
+          scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)));
+        }
+        for quad in &annot.quads {
+          let mut shape = BezPath::new();
+          let (x0, y0) = pt(quad[0], quad[1]);
+          shape.move_to((x0, y0));
+          for pair in quad.chunks(2).skip(1) {
+            let (x, y) = pt(pair[0], pair[1]);
+            shape.line_to((x, y));
+          }
+          shape.close_path();
+          scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &shape);
+        }
+      }
+      "Underline" | "StrikeOut" => {
+        let brush = Brush::Solid(rgba(color, 1.0));
+        let stroke = Stroke::new(1.0 * self.zoom as f64);
+        let lines: Vec<(f32, f32, f32, f32)> = if annot.quads.is_empty() {
+          let (y, frac) = if annot.subtype == "Underline" { (annot.rect[1], 0.0) } else { (0.0, 0.5) };
+          let yy = if annot.subtype == "Underline" { y } else { annot.rect[1] + (annot.rect[3] - annot.rect[1]) * frac };
+          vec![(annot.rect[0], yy, annot.rect[2], yy)]
+        } else {
+          annot
+            .quads
+            .iter()
+            .map(|q| {
+              let ys = [q[1], q[3], q[5], q[7]];
+              let yy = if annot.subtype == "Underline" {
+                ys.iter().fold(f32::INFINITY, |a, b| a.min(*b))
+              } else {
+                (ys.iter().fold(f32::INFINITY, |a, b| a.min(*b)) + ys.iter().fold(f32::NEG_INFINITY, |a, b| a.max(*b))) / 2.0
+              };
+              (q[0].min(q[2].min(q[4].min(q[6]))), yy, q[0].max(q[2].max(q[4].max(q[6]))), yy)
+            })
+            .collect()
+        };
+        for (x0, y0, x1, y1) in lines {
+          let mut shape = BezPath::new();
+          shape.move_to(pt(x0, y0));
+          shape.line_to(pt(x1, y1));
+          scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &shape);
+        }
+      }
+      "Square" | "Circle" => {
+        if annot.border_width <= 0.0 {
+          return;
+        }
+        let brush = Brush::Solid(rgba(color, 1.0));
+        let stroke = Stroke::new((annot.border_width.max(0.5) * self.zoom) as f64);
+        if annot.subtype == "Circle" {
+          let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
+          let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
+          let shape = vello::kurbo::Ellipse::new(
+            vello::kurbo::Point::new((x0 + x1) / 2.0, (y0 + y1) / 2.0),
+            ((x1 - x0).abs() / 2.0, (y1 - y0).abs() / 2.0),
+            0.0,
+          );
+          scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &shape);
+        } else {
+          let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
+          let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
+          scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)));
+        }
+      }
+      "Ink" => {
+        let brush = Brush::Solid(rgba(color, 1.0));
+        let stroke = Stroke::new(1.0 * self.zoom as f64);
+        for line in &annot.ink {
+          if line.len() < 2 {
+            continue;
+          }
+          let mut shape = BezPath::new();
+          let (x0, y0) = pt(line[0].0, line[0].1);
+          shape.move_to((x0, y0));
+          for (x, y) in &line[1..] {
+            let (px, py) = pt(*x, *y);
+            shape.line_to((px, py));
+          }
+          scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &shape);
+        }
+      }
+      "Link" => {
+        if annot.border_width <= 0.0 {
+          return;
+        }
+        let brush = Brush::Solid(rgba(color, 1.0));
+        let stroke = Stroke::new((annot.border_width.max(0.5) * self.zoom) as f64);
+        let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
+        let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
+        scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)));
+      }
+      _ => {}
     }
   }
 

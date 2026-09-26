@@ -1,3 +1,4 @@
+use crate::annot::Annotation;
 use crate::error::Result;
 use crate::graphics::{FontInfo, MapResources, PageItem, interpret, text_runs};
 use crate::parser::PageFont;
@@ -53,6 +54,8 @@ pub struct PdfPage {
   pub runs: Vec<PdfTextRun>,
   /// All page items (text, paths, clipping, state markers).
   pub items: Vec<PageItem>,
+  /// Page annotations (links, markup); filled by the document layer.
+  pub annotations: Vec<Annotation>,
 }
 
 impl PdfPage {
@@ -83,7 +86,7 @@ impl PdfPage {
     let provider = MapResources { fonts: fonts.iter().map(|f| (f.resource.clone(), FontInfo::simple(&f.resource, &f.base_font))).collect() };
     let items = interpret(content, provider)?;
     let runs = text_runs(&items);
-    Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items })
+    Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items, annotations: Vec::new() })
   }
 }
 

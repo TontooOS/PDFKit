@@ -231,6 +231,10 @@ pub enum PageItem {
   Pattern(String),
   /// Skipped content with a reason (unsupported filter, depth limit).
   Skipped(String),
+  /// Marked-content section start (`BMC`/`BDC` with tag).
+  BeginMarked(Marked),
+  /// Marked-content section end (`EMC`).
+  EndMarked,
   /// Graphics state push (`q`); bounds clip lifetime for the view.
   Save,
   /// Graphics state pop (`Q`).
@@ -279,6 +283,15 @@ impl InlineVal {
       Token::Op(op) => Self::Name(op.clone()),
     }
   }
+}
+
+/// A marked-content section tag with optional property name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Marked {
+  /// Tag name, e.g. `Span`, `Artifact`.
+  pub tag: String,
+  /// Property name (`BDC` second operand) or dict marker.
+  pub prop: Option<String>,
 }
 
 /// Maximum form XObject nesting (guards cyclic forms).
@@ -1252,8 +1265,27 @@ impl<R: ResourceProvider> Interp<R> {
           self.paint_shading(name);
         }
       }
-      // Marked content: structure only, no rendering effect in M3.
-      "BMC" | "BDC" | "EMC" | "MP" | "DP" => {}
+      // Marked content: structure markers, no rendering effect.
+      "BMC" => {
+        if let Some(tag) = ops.first().and_then(token_name) {
+          self.items.push(PageItem::BeginMarked(Marked { tag: tag.into(), prop: None }));
+        }
+      }
+      "BDC" => {
+        if ops.len() >= 2 {
+          let tag = token_name(&ops[0]).unwrap_or("").to_owned();
+          let prop = match &ops[1] {
+            Token::Name(n) => Some(n.clone()),
+            Token::Dict(_) => Some(String::from("<dict>")),
+            _ => None,
+          };
+          if !tag.is_empty() {
+            self.items.push(PageItem::BeginMarked(Marked { tag, prop }));
+          }
+        }
+      }
+      "EMC" => self.items.push(PageItem::EndMarked),
+      "MP" | "DP" => {}
       _ => {}
     }
     Ok(())

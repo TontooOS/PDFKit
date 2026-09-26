@@ -17,6 +17,7 @@
 //! assert_eq!(view.page_count(), pages);
 //! ```
 
+pub mod annot;
 pub mod document;
 pub mod color;
 pub mod error;
@@ -31,12 +32,13 @@ pub mod parser;
 pub mod view;
 
 pub use color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
+pub use annot::{Annotation, DocInfo, LinkTarget, Outline, parse_annotation, parse_info, parse_outlines, pdfdoc_to_string};
 pub use document::PdfDocument;
 pub use font::{CMap, DecoderKind, FontDecoder, RangeDst, apply_differences, glyph_name_to_char, parse_cmap};
 pub use error::{PdfError, Result};
 pub use graphics::{
-  ExtGState, FillRule, FontInfo, GradientItem, InlineVal, MapResources, Matrix, MAX_FORM_DEPTH, NoResources, PageItem,
-  PathItem, PathSeg, PlacedImage, ResourceProvider, Rgb, StrokeStyle, XObjectResult, cmyk_to_rgb, interpret,
+  ExtGState, FillRule, FontInfo, GradientItem, InlineVal, MapResources, Marked, Matrix, MAX_FORM_DEPTH, NoResources,
+  PageItem, PathItem, PathSeg, PlacedImage, ResourceProvider, Rgb, StrokeStyle, XObjectResult, cmyk_to_rgb, interpret,
   interpret_with, text_runs,
 };
 pub use image::{DecodedImage, apply_alpha, apply_constant_alpha, decode_jpeg, decode_mask_alpha, decode_samples, decode_smask_alpha};

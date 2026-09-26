@@ -29,6 +29,8 @@ pub struct PageFont {
 /// One page found by walking the page tree.
 #[derive(Debug, Clone)]
 pub struct ParsedPage {
+  /// Indirect object number of the page dict.
+  pub objnum: u32,
   /// Zero-based page index in document order.
   pub index: usize,
   /// `/MediaBox` in points `[x0, y0, x1, y1]`.
@@ -40,6 +42,8 @@ pub struct ParsedPage {
   /// Resolved `/Resources` dict (inherited); `Null` when absent.
   /// Kept for ExtGState, XObject and color space lookups.
   pub resources: PdfValue,
+  /// Raw `/Annots` entries (page-level, not inherited).
+  pub annots: Vec<PdfValue>,
 }
 
 /// Parses the file structure: header, xref table or stream, trailer
@@ -488,7 +492,13 @@ impl FileParser {
       let content = self.page_content(&node.value)?;
       let resolved_res = self.resolve(resources).unwrap_or(PdfValue::Null);
       let fonts = self.page_fonts(&resolved_res)?;
-      out.push(ParsedPage { index, media_box, content, fonts, resources: resolved_res });
+      let annots = node
+        .value
+        .get("Annots")
+        .and_then(|v| self.resolve(v).ok())
+        .and_then(|v| v.as_array().map(|a| a.to_vec()))
+        .unwrap_or_default();
+      out.push(ParsedPage { objnum: node_num, index, media_box, content, fonts, resources: resolved_res, annots });
       return Ok(());
     }
     let kids = node
@@ -603,6 +613,17 @@ impl FileParser {
 
   fn decoded_content(&self, num: u32) -> Result<Vec<u8>> {
     Ok(self.decoded_stream(num)?.1)
+  }
+
+  /// Resolved document catalog dict (`trailer /Root`).
+  pub fn catalog(&self) -> Result<PdfValue> {
+    let root = self.trailer.get("Root").ok_or_else(|| PdfError::InvalidObject("trailer has no /Root".into()))?;
+    self.resolve(root)
+  }
+
+  /// Resolved trailer `/Info` dict, if present.
+  pub fn info_dict(&self) -> Option<PdfValue> {
+    self.trailer.get("Info").and_then(|v| self.resolve(v).ok())
   }
 
   /// Number of indirect objects found (structure info for tests).
