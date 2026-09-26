@@ -6,32 +6,39 @@ use tontooui::renderer::images::ImageLoader;
 use tontooui::renderer::text::{FontSystem, SolidBrush, draw_layout};
 use tontooui::theme::ThemeMode;
 use vello::Scene;
-use vello::kurbo::{Affine, Rect};
+use vello::kurbo::{Affine, BezPath, Cap, Join, Rect, Stroke};
 use vello::peniko::{Brush, Color, Fill};
 
 use crate::document::PdfDocument;
+use crate::graphics::{FillRule, PageItem, PathItem, PathSeg};
 use crate::page::PdfTextRun;
 
-/// Page background in dark mode (TontooOS default app background).
+/// Page paper color (real viewers keep paper white in both themes;
+/// the window chrome around the page follows the theme instead).
+pub const PDF_PAPER: Color = Color::from_rgb8(255, 255, 255);
+/// Page background in dark mode (kept for API compatibility).
 pub const PDF_BG_DARK: Color = Color::from_rgb8(27, 32, 34);
-/// Page background in light mode.
+/// Page background in light mode (kept for API compatibility).
 pub const PDF_BG_LIGHT: Color = Color::from_rgb8(255, 255, 255);
-/// Default PDF text color in dark mode.
+/// Default PDF text color in dark mode (kept for API compatibility).
 pub const PDF_TEXT_DARK: Color = Color::from_rgb8(216, 217, 217);
-/// Default PDF text color in light mode.
+/// Default PDF text color in light mode (kept for API compatibility).
 pub const PDF_TEXT_LIGHT: Color = Color::from_rgb8(39, 39, 39);
+
+/// One laid-out text run with its view position.
+struct RunLayout {
+  layout: Layout<SolidBrush>,
+  x: f32,
+  y: f32,
+}
 
 /// A real page-based PDF view for TontooUI.
 ///
-/// The view owns a `PdfDocument` and renders the current page as
-/// positioned text runs through the shared `FontSystem` (SF Pro via
-/// system fonts, Parley layout, Vello glyphs). Nothing is rasterized
-/// to a bitmap: every `PdfTextRun` keeps its PDF coordinates, so the
-/// later editor milestone can select and edit text in place.
-///
-/// v0.1 renders text only and maps all runs to the theme text color
-/// (PDF color operators, images, paths and annotations follow in
-/// later milestones).
+/// The view owns a `PdfDocument` and renders the current page from its
+/// vector/text item model through the shared `FontSystem` (SF Pro via
+/// system fonts, Parley layout, Vello glyphs) and Vello paths. Nothing
+/// is rasterized to a bitmap: every run and path keeps its PDF
+/// coordinates, so the editor milestone can select and edit in place.
 pub struct PdfView {
   doc: PdfDocument,
   page_no: usize,
@@ -41,7 +48,7 @@ pub struct PdfView {
   y: f32,
   width: f32,
   height: f32,
-  layouts: Vec<Layout<SolidBrush>>,
+  runs: Vec<RunLayout>,
   layout_scale: f32,
   dirty: bool,
 }
@@ -58,7 +65,7 @@ impl PdfView {
       y: 0.0,
       width: 0.0,
       height: 0.0,
-      layouts: Vec::new(),
+      runs: Vec::new(),
       layout_scale: 0.0,
       dirty: true,
     }
@@ -107,7 +114,8 @@ impl PdfView {
     self.zoom
   }
 
-  /// Follow the system theme (dark page background vs paper white).
+  /// Follow the system theme (window chrome; the paper stays white
+  /// like in standard viewers while PDF colors are honored).
   pub fn set_theme(&mut self, mode: ThemeMode) {
     let dark = mode == ThemeMode::Dark;
     if dark != self.dark {
@@ -128,67 +136,168 @@ impl PdfView {
     }
   }
 
-  fn text_color(&self) -> Color {
-    if self.dark { PDF_TEXT_DARK } else { PDF_TEXT_LIGHT }
+  /// Map a user-space point to view logical px (y flipped).
+  fn map_point(&self, ox: f32, oy1: f32, ux: f32, uy: f32) -> (f32, f32) {
+    (self.x + (ux - ox) * self.zoom, self.y + (oy1 - uy) * self.zoom)
   }
 
-  fn bg_color(&self) -> Color {
-    if self.dark { PDF_BG_DARK } else { PDF_BG_LIGHT }
-  }
-
-  fn runs(&self) -> &[PdfTextRun] {
-    match self.doc.page(self.page_no) {
-      Ok(page) => &page.runs,
-      Err(_) => &[],
-    }
+  /// View position of a run: baseline-to-top approximation
+  /// (ascent ~= font size); exact metrics need embedded fonts (M5).
+  fn run_origin(&self, run: &PdfTextRun, ox: f32, oy1: f32) -> (f32, f32) {
+    let (px, py) = self.map_point(ox, oy1, run.x, run.y);
+    (px, py - run.font_size * self.zoom)
   }
 
   fn ensure_layouts(&mut self, fonts: &mut FontSystem) {
-    if !self.dirty && !self.layouts.is_empty() && self.layout_scale == fonts.scale {
+    if !self.dirty && !self.runs.is_empty() && self.layout_scale == fonts.scale {
       return;
     }
-    self.layouts.clear();
-    let color = self.text_color();
-    // Clone runs to satisfy the borrow checker (doc vs fonts borrows).
-    let runs: Vec<PdfTextRun> = self.runs().to_vec();
-    for run in &runs {
-      let weight = if run.bold { 700.0 } else { 400.0 };
-      let layout = fonts.layout_text_weighted(&run.text, run.font_size * self.zoom, color, weight, None);
-      self.layouts.push(layout);
+    self.runs.clear();
+    let page = match self.doc.page(self.page_no) {
+      Ok(page) => page.clone(),
+      Err(_) => {
+        self.layout_scale = fonts.scale;
+        self.dirty = false;
+        return;
+      }
+    };
+    for item in &page.items {
+      if let PageItem::Text(run) = item {
+        let weight = if run.bold { 700.0 } else { 400.0 };
+        let color = Color::from_rgb8(
+          (run.color_rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
+          (run.color_rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
+          (run.color_rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+        );
+        let layout = fonts.layout_text_weighted(&run.text, run.font_size * self.zoom, color, weight, None);
+        let (x, y) = self.run_origin(run, page.origin_x, page.origin_y + page.height);
+        self.runs.push(RunLayout { layout, x, y });
+      }
     }
     self.layout_scale = fonts.scale;
     self.dirty = false;
   }
 
-  /// View position of a run: PDF origin is bottom-left in points,
-  /// the view origin is top-left in logical px.
-  fn run_origin(&self, run: &PdfTextRun) -> (f32, f32) {
-    let page_h = self.doc.page(self.page_no).map(|p| p.height).unwrap_or(0.0);
-    let ox = self.x + run.x * self.zoom;
-    // Baseline-to-top approximation (ascent ~= font size); exact
-    // metrics need embedded fonts (later milestone).
-    let oy = self.y + (page_h - run.y) * self.zoom - run.font_size * self.zoom;
-    (ox, oy)
+  fn path_shape(&self, item: &PathItem, ox: f32, oy1: f32) -> BezPath {
+    let mut shape = BezPath::new();
+    for sub in &item.subpaths {
+      for seg in sub {
+        match seg {
+          PathSeg::Move(x, y) => {
+            let (px, py) = self.mapped(*x, *y, ox, oy1, &item.ctm);
+            shape.move_to((px as f64, py as f64));
+          }
+          PathSeg::Line(x, y) => {
+            let (px, py) = self.mapped(*x, *y, ox, oy1, &item.ctm);
+            shape.line_to((px as f64, py as f64));
+          }
+          PathSeg::Curve(x1, y1, x2, y2, x3, y3) => {
+            let (a, b) = self.mapped(*x1, *y1, ox, oy1, &item.ctm);
+            let (c, d) = self.mapped(*x2, *y2, ox, oy1, &item.ctm);
+            let (e, f) = self.mapped(*x3, *y3, ox, oy1, &item.ctm);
+            shape.curve_to((a as f64, b as f64), (c as f64, d as f64), (e as f64, f as f64));
+          }
+          PathSeg::Close => shape.close_path(),
+        }
+      }
+    }
+    shape
+  }
+
+  fn mapped(&self, x: f32, y: f32, ox: f32, oy1: f32, ctm: &crate::graphics::Matrix) -> (f32, f32) {
+    let (ux, uy) = ctm.apply(x, y);
+    self.map_point(ox, oy1, ux, uy)
   }
 
   fn render(&mut self, scene: &mut Scene, fonts: &mut FontSystem) {
     let scale = fonts.scale;
     self.ensure_layouts(fonts);
-    let bg = self.bg_color();
     let (page_w, page_h) = self.page_size();
     scene.fill(
       Fill::NonZero,
       Affine::translate((self.x as f64, self.y as f64)),
-      &Brush::Solid(bg),
+      &Brush::Solid(PDF_PAPER),
       None,
       &Rect::new(0.0, 0.0, page_w as f64, page_h as f64),
     );
-    let runs: Vec<PdfTextRun> = self.runs().to_vec();
-    for (run, layout) in runs.iter().zip(self.layouts.iter()) {
-      let (ox, oy) = self.run_origin(run);
-      draw_layout(scene, layout, ox, oy, scale);
+    let page = match self.doc.page(self.page_no) {
+      Ok(page) => page.clone(),
+      Err(_) => return,
+    };
+    let (ox, oy1) = (page.origin_x, page.origin_y + page.height);
+    let mut run_idx = 0usize;
+    let mut clip_depth = 0usize;
+    let mut save_stack: Vec<usize> = Vec::new();
+    for item in &page.items {
+      match item {
+        PageItem::Text(_) => {
+          if let Some(run) = self.runs.get(run_idx) {
+            draw_layout(scene, &run.layout, run.x, run.y, scale);
+          }
+          run_idx += 1;
+        }
+        PageItem::Path(path) => {
+          let shape = self.path_shape(path, ox, oy1);
+          if let Some(rule) = path.clip {
+            scene.push_clip_layer(fill_of(rule), Affine::IDENTITY, &shape);
+            clip_depth += 1;
+          }
+          if let Some((rgb, rule)) = &path.fill {
+            scene.fill(fill_of(*rule), Affine::IDENTITY, &Brush::Solid(rgb.to_color()), None, &shape);
+          }
+          if let Some((rgb, style)) = &path.stroke {
+            scene.stroke(&vello_stroke(style, self.zoom), Affine::IDENTITY, &Brush::Solid(rgb.to_color()), None, &shape);
+          }
+        }
+        PageItem::Save => save_stack.push(clip_depth),
+        PageItem::Restore => {
+          if let Some(depth) = save_stack.pop() {
+            while clip_depth > depth {
+              scene.pop_layer();
+              clip_depth -= 1;
+            }
+          }
+        }
+        // XObjects and shadings resolve in M4/M6; skipped for now.
+        PageItem::XObject(_) | PageItem::Shading(_) => {}
+      }
+    }
+    while clip_depth > 0 {
+      scene.pop_layer();
+      clip_depth -= 1;
     }
   }
+}
+
+fn fill_of(rule: FillRule) -> Fill {
+  match rule {
+    FillRule::NonZero => Fill::NonZero,
+    FillRule::EvenOdd => Fill::EvenOdd,
+  }
+}
+
+fn vello_stroke(style: &crate::graphics::StrokeStyle, zoom: f32) -> Stroke {
+  let mut stroke = Stroke::new((style.width.max(0.0) * zoom) as f64);
+  let cap = match style.cap {
+    1 => Cap::Round,
+    2 => Cap::Square,
+    _ => Cap::Butt,
+  };
+  stroke.start_cap = cap;
+  stroke.end_cap = cap;
+  stroke.join = match style.join {
+    1 => Join::Round,
+    2 => Join::Bevel,
+    _ => Join::Miter,
+  };
+  stroke.miter_limit = style.miter as f64;
+  if !style.dash.is_empty() {
+    stroke = stroke.with_dashes(
+      (style.phase * zoom) as f64,
+      style.dash.iter().map(|d| (d * zoom) as f64),
+    );
+  }
+  stroke
 }
 
 impl View for PdfView {

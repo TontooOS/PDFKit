@@ -37,6 +37,9 @@ pub struct ParsedPage {
   pub content: Vec<u8>,
   /// Fonts declared in the page resources.
   pub fonts: Vec<PageFont>,
+  /// Resolved `/Resources` dict (inherited); `Null` when absent.
+  /// Kept for ExtGState, XObject and color space lookups.
+  pub resources: PdfValue,
 }
 
 /// Parses the file structure: header, xref table or stream, trailer
@@ -483,8 +486,9 @@ impl FileParser {
       let index = out.len();
       let media_box = Self::media_box(media);
       let content = self.page_content(&node.value)?;
-      let fonts = self.page_fonts(resources)?;
-      out.push(ParsedPage { index, media_box, content, fonts });
+      let resolved_res = self.resolve(resources).unwrap_or(PdfValue::Null);
+      let fonts = self.page_fonts(&resolved_res)?;
+      out.push(ParsedPage { index, media_box, content, fonts, resources: resolved_res });
       return Ok(());
     }
     let kids = node
