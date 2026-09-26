@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::graphics::{MapResources, PageItem, interpret, text_runs};
+use crate::graphics::{FontInfo, MapResources, PageItem, interpret, text_runs};
 use crate::parser::PageFont;
 
 /// One positioned text run on a page.
@@ -80,9 +80,7 @@ impl PdfPage {
   pub fn interpret(number: usize, media_box: [f32; 4], content: &[u8], fonts: &[PageFont]) -> Result<Self> {
     let width = (media_box[2] - media_box[0]).max(1.0);
     let height = (media_box[3] - media_box[1]).max(1.0);
-    let provider = MapResources {
-      fonts: fonts.iter().map(|f| (f.resource.clone(), f.base_font.clone())).collect(),
-    };
+    let provider = MapResources { fonts: fonts.iter().map(|f| (f.resource.clone(), FontInfo::simple(&f.resource, &f.base_font))).collect() };
     let items = interpret(content, provider)?;
     let runs = text_runs(&items);
     Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items })
@@ -91,9 +89,7 @@ impl PdfPage {
 
 /// Interpret content with a plain font list (used by tests).
 pub fn interpret_content(content: &[u8], fonts: &[PageFont]) -> Result<Vec<PdfTextRun>> {
-  let provider = MapResources {
-    fonts: fonts.iter().map(|f| (f.resource.clone(), f.base_font.clone())).collect(),
-  };
+  let provider = MapResources { fonts: fonts.iter().map(|f| (f.resource.clone(), FontInfo::simple(&f.resource, &f.base_font))).collect() };
   Ok(text_runs(&interpret(content, provider)?))
 }
 

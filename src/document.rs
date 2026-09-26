@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 use crate::error::{PdfError, Result};
+use crate::font::{DecoderKind, FontDecoder, apply_differences, parse_cmap};
 use crate::graphics::{ExtGState, FontInfo, ResourceProvider, Rgb, interpret, text_runs};
 use crate::objects::PdfValue;
 use crate::page::PdfPage;
@@ -34,11 +35,13 @@ impl PdfDocument {
     let parsed = parser.pages()?;
     let mut pages = Vec::with_capacity(parsed.len());
     for item in &parsed {
-      let provider = DocProvider {
-        parser,
-        resources: item.resources.clone(),
-        fonts: item.fonts.iter().map(|f| (f.resource.clone(), f.base_font.clone())).collect(),
-      };
+      let builder = FontBuilder { parser };
+      let mut fonts = HashMap::new();
+      for font in &item.fonts {
+        let info = builder.info(&item.resources, &font.resource);
+        fonts.insert(font.resource.clone(), info);
+      }
+      let provider = DocProvider { parser, resources: item.resources.clone(), fonts };
       let items = interpret(&item.content, provider)?;
       let runs = text_runs(&items);
       let width = (item.media_box[2] - item.media_box[0]).max(1.0);
@@ -76,17 +79,183 @@ impl PdfDocument {
   }
 }
 
+/// Builds full `FontInfo` values (encoding, ToUnicode, widths)
+///
+/// from page font resources.
+struct FontBuilder<'a> {
+  parser: &'a FileParser,
+}
+
+impl<'a> FontBuilder<'a> {
+  fn info(&self, resources: &PdfValue, resource: &str) -> FontInfo {
+    let fallback = FontInfo::simple(resource, "Unknown");
+    let font_ref = resources
+      .get("Font")
+      .and_then(|fonts| self.parser.resolve_value(fonts).ok())
+      .and_then(|fonts| fonts.get(resource).cloned())
+      .and_then(|entry| self.parser.resolve_value(&entry).ok());
+    let dict = match font_ref {
+      Some(PdfValue::Dict(_)) => font_ref.unwrap(),
+      _ => return fallback,
+    };
+    let subtype = dict.get("Subtype").and_then(|v| v.as_name()).unwrap_or("").to_owned();
+    let base_font = dict.get("BaseFont").and_then(|v| v.as_name()).unwrap_or("Unknown").to_owned();
+    let mut bold = base_font.to_lowercase().contains("bold");
+    let mut italic =
+      base_font.to_lowercase().contains("italic") || base_font.to_lowercase().contains("oblique");
+    let mut missing_width = 500.0;
+    if let Some(desc) = dict.get("FontDescriptor").and_then(|v| self.parser.resolve_value(v).ok()) {
+      let flags = desc.get("Flags").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+      if flags & (1 << 18) != 0 {
+        bold = true;
+      }
+      if flags & (1 << 6) != 0 {
+        italic = true;
+      }
+      missing_width = desc.get("MissingWidth").and_then(|v| v.as_number()).unwrap_or(500.0) as f32;
+    }
+    // ToUnicode CMap (top level, also used by Type0).
+    let cmap = dict
+      .get("ToUnicode")
+      .and_then(|v| match v {
+        PdfValue::Ref(n, _) => Some(*n),
+        _ => None,
+      })
+      .and_then(|n| self.parser.decoded_stream(n).ok())
+      .and_then(|(_, bytes)| parse_cmap(&bytes).ok());
+    if subtype == "Type0" {
+      return self.cid_font(resource, &base_font, bold, italic, &dict, cmap, missing_width);
+    }
+    self.simple_font(resource, &base_font, bold, italic, &dict, cmap, missing_width)
+  }
+
+  fn simple_font(
+    &self,
+    resource: &str,
+    base_font: &str,
+    bold: bool,
+    italic: bool,
+    dict: &PdfValue,
+    cmap: Option<crate::font::CMap>,
+    missing_width: f32,
+  ) -> FontInfo {
+    let _ = bold;
+    let (base_name, diffs) = match dict.get("Encoding").and_then(|v| self.parser.resolve_value(v).ok()) {
+      Some(PdfValue::Name(name)) => (name, vec![]),
+      Some(PdfValue::Dict(_)) => {
+        let enc = dict.get("Encoding").and_then(|v| self.parser.resolve_value(v).ok()).unwrap_or(PdfValue::Null);
+        let base = enc.get("BaseEncoding").and_then(|v| v.as_name()).unwrap_or("WinAnsiEncoding").to_owned();
+        (base, Self::differences(&enc))
+      }
+      _ => ("WinAnsiEncoding".into(), vec![]),
+    };
+    let mut decoder = FontDecoder::simple_named(&base_name);
+    if !diffs.is_empty() {
+      if let DecoderKind::Simple(ref mut table) = decoder.kind {
+        apply_differences(table, &diffs);
+      }
+    }
+    // Widths for FirstChar..LastChar.
+    let first = dict.get("FirstChar").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+    if let Some(items) = dict.get("Widths").and_then(|v| v.as_array()) {
+      for (i, item) in items.iter().enumerate() {
+        if let Some(w) = item.as_number() {
+          decoder.widths.insert(first + i as u32, w as f32);
+        }
+      }
+    }
+    decoder.default_width = missing_width;
+    if let Some(cmap) = cmap {
+      decoder.kind = DecoderKind::CMap(cmap);
+    }
+    FontInfo { resource: resource.into(), base_font: base_font.into(), italic, decoder }
+  }
+
+  fn cid_font(
+    &self,
+    resource: &str,
+    base_font: &str,
+    bold: bool,
+    italic: bool,
+    dict: &PdfValue,
+    cmap: Option<crate::font::CMap>,
+    missing_width: f32,
+  ) -> FontInfo {
+    let _ = bold;
+    let descendant = dict
+      .get("DescendantFonts")
+      .and_then(|v| v.as_array())
+      .and_then(|a| a.first().cloned())
+      .and_then(|v| self.parser.resolve_value(&v).ok());
+    let mut widths = HashMap::new();
+    let mut default_width = 1000.0;
+    if let Some(cid) = descendant {
+      default_width = cid.get("DW").and_then(|v| v.as_number()).unwrap_or(1000.0) as f32;
+      if let Some(items) = cid.get("W").and_then(|v| v.as_array()) {
+        let mut i = 0;
+        while i < items.len() {
+          let lo = items.get(i).and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+          match items.get(i + 1) {
+            Some(PdfValue::Array(list)) => {
+              for (k, w) in list.iter().enumerate() {
+                if let Some(width) = w.as_number() {
+                  widths.insert(lo + k as u32, width as f32);
+                }
+              }
+              i += 2;
+            }
+            Some(end) => {
+              let hi = end.as_number().unwrap_or(lo as f64) as u32;
+              let w = items.get(i + 2).and_then(|v| v.as_number()).unwrap_or(1000.0) as f32;
+              for code in lo..=hi.min(lo + 10000) {
+                widths.insert(code, w);
+              }
+              i += 3;
+            }
+            None => break,
+          }
+        }
+      }
+      if let Some(desc) = cid.get("FontDescriptor").and_then(|v| self.parser.resolve_value(v).ok()) {
+        default_width = desc.get("MissingWidth").and_then(|v| v.as_number()).unwrap_or(default_width as f64) as f32;
+      }
+    }
+    let _ = missing_width;
+    let kind = match cmap {
+      Some(cmap) => DecoderKind::CMap(cmap),
+      None => DecoderKind::Identity,
+    };
+    FontInfo { resource: resource.into(), base_font: base_font.into(), italic, decoder: FontDecoder { kind, widths, default_width } }
+  }
+
+  fn differences(enc: &PdfValue) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    if let Some(items) = enc.get("Differences").and_then(|v| v.as_array()) {
+      let mut code = 0u32;
+      for item in items {
+        match item {
+          PdfValue::Number(n) => code = *n as u32,
+          PdfValue::Name(name) => {
+            out.push((code, name.clone()));
+            code += 1;
+          }
+          _ => {}
+        }
+      }
+    }
+    out
+  }
+}
 /// Document-backed resources for one page: fonts plus reference
 /// resolution for ExtGState, color spaces, shadings and patterns.
 struct DocProvider<'a> {
   parser: &'a FileParser,
   resources: PdfValue,
-  fonts: HashMap<String, String>,
+  fonts: HashMap<String, FontInfo>,
 }
-
 impl<'a> ResourceProvider for DocProvider<'a> {
   fn font(&self, name: &str) -> Option<FontInfo> {
-    self.fonts.get(name).map(|base_font| FontInfo { resource: name.into(), base_font: base_font.clone() })
+    self.fonts.get(name).cloned()
   }
 
   fn extgstate(&self, name: &str) -> Option<ExtGState> {
@@ -370,6 +539,44 @@ mod tests {
     let doc = PdfDocument::load_bytes(pdf).unwrap();
     assert_eq!(doc.page_count(), 1);
     assert!(doc.page(0).unwrap().text().contains("Hello PDF"));
+  }
+
+  #[test]
+  fn tounicode_and_widths_end_to_end() {
+    let cmap = b"1 begincodespacerange <00> <FF> endcodespacerange 1 beginbfchar <41> <00E6> endbfchar";
+    let content = b"BT /F1 12 Tf 72 720 Td (A) Tj (B) Tj ET";
+    let font = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 65 /LastChar 66 /Widths [500 600] /ToUnicode 6 0 R >>";
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>".to_vec(),
+      [b"<< /Length ".to_vec(), content.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), content.to_vec(), b"\nendstream".to_vec()].concat(),
+      font.to_vec(),
+      [b"<< /Length ".to_vec(), cmap.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), cmap.to_vec(), b"\nendstream".to_vec()].concat(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+      offsets.push(pdf.len());
+      pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+      pdf.extend_from_slice(body);
+      pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+      pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(b"trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n");
+    pdf.extend_from_slice(xref.to_string().as_bytes());
+    pdf.extend_from_slice(b"\n%%EOF");
+    let doc = PdfDocument::load_bytes(pdf).unwrap();
+    let page = doc.page(0).unwrap();
+    assert_eq!(page.runs.len(), 2);
+    assert_eq!(page.runs[0].text, "æ");
+    // Advance uses the real width: 500/1000 * 12pt = 6pt.
+    assert_eq!(page.runs[1].x, 72.0 + 6.0);
   }
 
   #[test]

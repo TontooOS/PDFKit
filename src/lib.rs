@@ -21,6 +21,7 @@ pub mod document;
 pub mod color;
 pub mod error;
 pub mod filter;
+pub mod font;
 pub mod graphics;
 pub mod lang;
 pub mod objects;
@@ -30,6 +31,7 @@ pub mod view;
 
 pub use color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 pub use document::PdfDocument;
+pub use font::{CMap, DecoderKind, FontDecoder, RangeDst, apply_differences, glyph_name_to_char, parse_cmap};
 pub use error::{PdfError, Result};
 pub use graphics::{
   ExtGState, FillRule, FontInfo, GradientItem, MapResources, Matrix, NoResources, PageItem, PathItem, PathSeg,

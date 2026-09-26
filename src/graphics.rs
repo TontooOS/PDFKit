@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use crate::color::{ResolvedPattern, ResolvedShading};
 use crate::error::{PdfError, Result};
-use crate::page::{PdfTextRun, decode_text};
+use crate::font::FontDecoder;
+use crate::page::PdfTextRun;
 
 /// 2D affine matrix `[a b c d e f]` in PDF row-vector convention:
 /// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`.
@@ -186,16 +187,31 @@ pub struct ExtGState {
   pub blend: Option<String>,
 }
 
-/// Font metadata handed to the interpreter (details grow in M5).
+/// Font metadata handed to the interpreter (encoding and widths
+/// resolve in full; glyph outlines stay with the system fonts).
 #[derive(Debug, Clone)]
 pub struct FontInfo {
   /// Resource name without slash, e.g. `F1`.
   pub resource: String,
   /// `/BaseFont` name, e.g. `Helvetica-Bold`.
   pub base_font: String,
+  /// True for italic/oblique faces.
+  pub italic: bool,
+  /// Byte-to-text/width decoder for this font.
+  pub decoder: FontDecoder,
 }
 
 impl FontInfo {
+  /// Plain WinAnsi font (used by tests and fallbacks).
+  pub fn simple(resource: &str, base_font: &str) -> Self {
+    Self {
+      resource: resource.into(),
+      base_font: base_font.into(),
+      italic: base_font.to_lowercase().contains("italic") || base_font.to_lowercase().contains("oblique"),
+      decoder: FontDecoder::winansi(),
+    }
+  }
+
   /// True when the base font name marks a bold face.
   pub fn is_bold(&self) -> bool {
     self.base_font.to_lowercase().contains("bold")
@@ -1092,7 +1108,8 @@ impl<R: ResourceProvider> Interp<R> {
       "Tj" => {
         if self.state().in_text {
           if let Some(Token::Str(bytes)) = ops.last() {
-            self.show(decode_text(bytes), 0.0)?;
+            let bytes = bytes.clone();
+            self.show(&bytes)?;
           }
         }
       }
@@ -1101,7 +1118,7 @@ impl<R: ResourceProvider> Interp<R> {
           if let Some(Token::Array(items)) = ops.last() {
             for item in items.clone() {
               match item {
-                Token::Str(bytes) => self.show(decode_text(&bytes), 0.0)?,
+                Token::Str(bytes) => self.show(&bytes)?,
                 Token::Num(adjust) => {
                   let dx = -(adjust as f32) * self.state().font_size / 1000.0 * self.state().h_scale;
                   let tlm = self.state().tlm;
@@ -1121,8 +1138,8 @@ impl<R: ResourceProvider> Interp<R> {
           st.tlm = Matrix::translate(0.0, -leading).concat(tlm);
           st.tlm = Matrix::translate(-st.tlm.e, 0.0).concat(st.tlm);
           if let Some(Token::Str(bytes)) = ops.last() {
-            let text = decode_text(bytes);
-            self.show(text, 0.0)?;
+            let bytes = bytes.clone();
+            self.show(&bytes)?;
           }
         }
       }
@@ -1140,8 +1157,8 @@ impl<R: ResourceProvider> Interp<R> {
           st.tlm = Matrix::translate(0.0, -leading).concat(tlm);
           st.tlm = Matrix::translate(-st.tlm.e, 0.0).concat(st.tlm);
           if let Some(Token::Str(bytes)) = ops.last() {
-            let text = decode_text(bytes);
-            self.show(text, 0.0)?;
+            let bytes = bytes.clone();
+            self.show(&bytes)?;
           }
         }
       }
@@ -1319,12 +1336,19 @@ impl<R: ResourceProvider> Interp<R> {
     Ok(())
   }
 
-  fn show(&mut self, text: String, _tj: f32) -> Result<()> {
-    if text.is_empty() || !self.state().in_text {
+  fn show(&mut self, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() || !self.state().in_text {
       return Ok(());
     }
     // Render mode 3 is invisible text (common for OCR layers).
     if self.state().render_mode == 3 {
+      return Ok(());
+    }
+    let st = self.state();
+    let decoder = self.res.font(&st.font).map(|f| f.decoder).unwrap_or_else(FontDecoder::winansi);
+    let codes = decoder.codes(bytes);
+    let text: String = codes.iter().map(|c| decoder.text_of(*c)).collect();
+    if text.is_empty() {
       return Ok(());
     }
     let st = self.state();
@@ -1347,11 +1371,11 @@ impl<R: ResourceProvider> Interp<R> {
       dir_y: dy,
       alpha,
     }));
-    // Advance estimate (exact advances need font metrics, M5):
-    // mean half-em per char plus char/word spacing.
-    let glyphs = text.chars().count() as f32;
+    // Advance from real glyph widths when known (1/1000 em),
+    // plus char/word spacing; falls back to half-em per code.
+    let widths: f32 = codes.iter().map(|c| decoder.width_of(*c)).sum::<f32>() / 1000.0;
     let spaces = text.chars().filter(|c| *c == ' ').count() as f32;
-    let advance = (glyphs * 0.5 * size + glyphs * char_space + spaces * word_space) * h_scale;
+    let advance = (widths * size + codes.len() as f32 * char_space + spaces * word_space) * h_scale;
     let tlm = self.state().tlm;
     self.state_mut().tlm = Matrix::translate(advance, 0.0).concat(tlm);
     Ok(())
@@ -1395,13 +1419,13 @@ impl ResourceProvider for NoResources {
 /// Map-based provider for unit tests.
 #[derive(Debug, Clone, Default)]
 pub struct MapResources {
-  /// Resource name to base font name.
-  pub fonts: HashMap<String, String>,
+  /// Resource name to font info.
+  pub fonts: HashMap<String, FontInfo>,
 }
 
 impl ResourceProvider for MapResources {
   fn font(&self, name: &str) -> Option<FontInfo> {
-    self.fonts.get(name).map(|base_font| FontInfo { resource: name.into(), base_font: base_font.clone() })
+    self.fonts.get(name).cloned()
   }
 }
 
@@ -1422,9 +1446,12 @@ mod tests {
 
   fn provider() -> MapResources {
     MapResources {
-      fonts: [("F1".into(), "Helvetica".into()), ("F2".into(), "Helvetica-Bold".into())]
-        .into_iter()
-        .collect(),
+      fonts: [
+        ("F1".into(), FontInfo::simple("F1", "Helvetica")),
+        ("F2".into(), FontInfo::simple("F2", "Helvetica-Bold")),
+      ]
+      .into_iter()
+      .collect(),
     }
   }
 
