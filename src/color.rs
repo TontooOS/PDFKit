@@ -95,7 +95,11 @@ pub fn parse_sampled(dict: &PdfValue, data: &[u8]) -> Result<Function> {
     .map(|a| a.len() / 2)
     .unwrap_or(1)
     .max(1);
-  let total: usize = size.iter().product::<usize>() * n_out;
+  let total: usize = size.iter().product::<usize>().saturating_mul(n_out);
+  // Sample tables are tiny in practice; corrupt Size vectors end here.
+  if total == 0 || total > 64 * 1024 * 1024 {
+    return Err(PdfError::InvalidObject("bad sampled Size".into()));
+  }
   let table = unpack_samples(data, bps, total)?;
   let mut encode = num_array(dict, "Encode", &[]);
   if encode.is_empty() {

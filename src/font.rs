@@ -177,10 +177,17 @@ fn tokenize_cmap(text: &str) -> Vec<String> {
     } else if b == b'[' || b == b']' {
       tokens.push((b as char).to_string());
       i += 1;
+    } else if b == b')' || b == b'>' || b == b'}' {
+      // Stray bytes (damaged streams): skip so tokenizing advances.
+      i += 1;
     } else {
       let start = i;
-      while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !b"<>[]%".contains(&bytes[i]) {
+      while i < bytes.len() && !bytes[i].is_ascii_whitespace() && !b"<>[]()%".contains(&bytes[i]) {
         i += 1;
+      }
+      if i == start {
+        i += 1;
+        continue;
       }
       tokens.push(text[start..i].into());
     }
@@ -643,6 +650,14 @@ mod tests {
     assert_eq!(table[174], 'ﬁ');
     assert_eq!(table[205], '—');
     assert_eq!(table[235], 'ß');
+  }
+
+  #[test]
+  fn stray_bytes_terminate_cmap() {
+    // Damaged streams must not spin the tokenizer into an
+    // allocation loop; valid entries still parse.
+    let cmap = parse_cmap(b")>]>\x00 1 beginbfchar <41> <0042> endbfchar ]").unwrap();
+    assert_eq!(cmap.text_of(0x41), "B");
   }
 
   #[test]

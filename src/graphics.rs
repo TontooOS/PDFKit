@@ -494,6 +494,13 @@ impl<'a> Lexer<'a> {
         while self.pos < self.data.len() && !is_delim(self.data[self.pos]) {
           self.pos += 1;
         }
+        if self.pos == start {
+          // Stray delimiter (e.g. `)`, `>`, `]` from damaged content):
+          // skip one byte so lexing always advances. Never emit empty
+          // operators; they would spin the interpreter forever.
+          self.pos += 1;
+          return self.next_token();
+        }
         Ok(Some(Token::Op(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned())))
       }
     }
@@ -629,6 +636,11 @@ impl<'a> Lexer<'a> {
           while self.pos < self.data.len() && !is_delim(self.data[self.pos]) && self.data[self.pos] != b']' {
             self.pos += 1;
           }
+          if self.pos == start {
+            // Stray delimiter inside arrays: skip it, keep the array alive.
+            self.pos += 1;
+            continue;
+          }
           items.push(Token::Op(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()));
         }
       }
@@ -648,7 +660,10 @@ impl<'a> Lexer<'a> {
         return Err(PdfError::ContentParse("unterminated dict".into()));
       }
       if self.data[self.pos] != b'/' {
-        return Err(PdfError::ContentParse("dict key must be a name".into()));
+        // Stray byte (damaged content): skip it instead of failing
+        // the whole stream, unless the dict ends here.
+        self.pos += 1;
+        continue;
       }
       self.pos += 1;
       let start = self.pos;
@@ -778,13 +793,12 @@ impl<'a> Lexer<'a> {
         Ok(Token::Name(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()))
       }
       Some(c) if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => Ok(Token::Num(self.read_number()?)),
-      _ => {
-        let start = self.pos;
-        while self.pos < self.data.len() && !is_delim(self.data[self.pos]) {
-          self.pos += 1;
-        }
-        Ok(Token::Name(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()))
+      Some(_) => {
+        // Stray byte in inline dicts: skip it.
+        self.pos += 1;
+        Ok(Token::Name(String::from("<skipped>")))
       }
+      None => Err(PdfError::ContentParse("truncated inline image".into())),
     }
   }
 }
@@ -1665,5 +1679,34 @@ mod tests {
     let items = interpret(b"q 1 0 0 RG 0 0 m 1 1 l S Q", provider()).unwrap();
     assert!(matches!(items[0], PageItem::Save));
     assert!(matches!(items[2], PageItem::Restore));
+  }
+
+  #[test]
+  fn stray_delimiters_terminate() {
+    // Damaged content must never spin the lexer: stray bytes are
+    // skipped and the valid tail still interprets.
+    let items = interpret(b") ] >> \x00 BT /F1 12 Tf (ok) Tj ET ]", provider()).unwrap();
+    let runs: Vec<_> = items
+      .iter()
+      .filter_map(|item| match item {
+        PageItem::Text(run) => Some(run),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].text, "ok");
+  }
+
+  #[test]
+  fn stray_inside_array_terminates() {
+    let items = interpret(b"BT /F1 12 Tf [(a) ) > (b)] TJ ET", provider()).unwrap();
+    let runs: Vec<_> = items
+      .iter()
+      .filter_map(|item| match item {
+        PageItem::Text(run) => Some(run),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(runs.len(), 2);
   }
 }

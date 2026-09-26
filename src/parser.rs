@@ -541,7 +541,7 @@ impl FileParser {
       .ok_or_else(|| PdfError::InvalidObject("catalog has no /Pages".into()))?;
     let pages_num = pages_ref.as_ref().map(|(n, _)| n).ok_or_else(|| PdfError::InvalidObject("/Pages is not a reference".into()))?;
     let mut out = Vec::new();
-    self.walk_pages(pages_num, &PdfValue::Null, &PdfValue::Null, &mut out)?;
+    self.walk_pages(pages_num, &PdfValue::Null, &PdfValue::Null, &PdfValue::Null, &mut out)?;
     if out.is_empty() {
       return Err(PdfError::NoPages);
     }
@@ -552,16 +552,20 @@ impl FileParser {
     &self,
     node_num: u32,
     inherited_box: &PdfValue,
+    inherited_crop: &PdfValue,
     inherited_res: &PdfValue,
     out: &mut Vec<ParsedPage>,
   ) -> Result<()> {
     let node = self.object(node_num)?;
     let kind = node.value.get("Type").and_then(|v| v.as_name()).unwrap_or("");
     let media = node.value.get("MediaBox").unwrap_or(inherited_box);
+    // Viewers clip to the CropBox when present (defaults to MediaBox).
+    let crop = node.value.get("CropBox").unwrap_or(inherited_crop);
+    let display = if crop == &PdfValue::Null { media } else { crop };
     let resources = node.value.get("Resources").unwrap_or(inherited_res);
     if kind == "Page" {
       let index = out.len();
-      let media_box = Self::media_box(media);
+      let media_box = Self::media_box(display);
       let content = self.page_content(&node.value)?;
       let resolved_res = self.resolve(resources).unwrap_or(PdfValue::Null);
       let fonts = self.page_fonts(&resolved_res)?;
@@ -581,7 +585,7 @@ impl FileParser {
       .ok_or_else(|| PdfError::InvalidObject("pages node has no /Kids".into()))?;
     for kid in kids {
       if let Some((num, _)) = kid.as_ref() {
-        self.walk_pages(num, media, resources, out)?;
+        self.walk_pages(num, media, crop, resources, out)?;
       }
     }
     Ok(())

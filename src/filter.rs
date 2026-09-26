@@ -1,6 +1,11 @@
 use crate::error::{PdfError, Result};
 use crate::objects::PdfValue;
 
+/// Hard cap for any single decoded stream (512 MiB). Legitimate
+/// streams stay far below; decompression bombs and corrupt length
+/// prefixes end here instead of in the OOM killer.
+pub const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
+
 /// Decode a stream body honoring `/Filter` and `/DecodeParms`.
 ///
 /// Supported in v0.1: `FlateDecode` (with PNG/TIFF predictors),
@@ -77,8 +82,12 @@ fn parms_list(dict: &PdfValue, count: usize) -> Result<Vec<PdfValue>> {
 fn inflate(raw: &[u8]) -> Result<Vec<u8>> {
   use std::io::Read;
   let mut decoder = flate2::read::ZlibDecoder::new(raw);
+  let mut limited = decoder.take(MAX_STREAM_BYTES as u64 + 1);
   let mut out = Vec::new();
-  decoder.read_to_end(&mut out).map_err(|e| PdfError::StreamDecode(e.to_string()))?;
+  limited.read_to_end(&mut out).map_err(|e| PdfError::StreamDecode(e.to_string()))?;
+  if out.len() > MAX_STREAM_BYTES {
+    return Err(PdfError::StreamDecode("stream exceeds size cap".into()));
+  }
   Ok(out)
 }
 
@@ -113,6 +122,11 @@ pub fn apply_predictor(data: &[u8], parms: &PdfValue) -> Result<Vec<u8>> {
     return Ok(out);
   }
   let row_bytes = (colors * columns * bits + 7) / 8;
+  // A row can never exceed the remaining input; corrupt DecodeParms
+  // (or hostile floats) end here instead of allocating gigabytes.
+  if row_bytes == 0 || row_bytes > data.len() {
+    return Err(PdfError::StreamDecode("bad predictor row length".into()));
+  }
   let stride = colors * ((bits + 7) / 8).max(1);
   let mut out = Vec::new();
   let mut pos = 0;
@@ -249,6 +263,9 @@ pub fn runlength_decode(data: &[u8]) -> Result<Vec<u8>> {
   let mut out = Vec::new();
   let mut i = 0;
   while i < data.len() {
+    if out.len() > MAX_STREAM_BYTES {
+      return Err(PdfError::StreamDecode("stream exceeds size cap".into()));
+    }
     let len = data[i] as usize;
     i += 1;
     if len == 128 {
@@ -333,6 +350,9 @@ pub fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
       return Err(PdfError::StreamDecode(format!("bad LZW code {code}")));
     };
     out.extend_from_slice(&entry);
+    if out.len() > MAX_STREAM_BYTES {
+      return Err(PdfError::StreamDecode("stream exceeds size cap".into()));
+    }
     if let Some(prev_seq) = prev {
       if next_code <= 4096 {
         let mut new_entry = prev_seq;
