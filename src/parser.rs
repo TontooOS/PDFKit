@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read;
 
 use crate::error::{PdfError, Result};
 use crate::objects::{ObjectParser, PdfValue};
@@ -354,29 +353,10 @@ impl FileParser {
     Self::decode_stream(&obj.value, &raw)
   }
 
-  /// Decode a stream body honoring `/Filter` (`None` and
-  /// `/FlateDecode`/`/Fl` supported in v0.1).
+  /// Decode a stream body honoring `/Filter` and `/DecodeParms`
+  /// (see the `filter` module for the supported set).
   pub fn decode_stream(dict: &PdfValue, raw: &[u8]) -> Result<Vec<u8>> {
-    let filters: Vec<String> = match dict.get("Filter") {
-      None | Some(PdfValue::Null) => vec![],
-      Some(PdfValue::Name(name)) => vec![name.clone()],
-      Some(PdfValue::Array(items)) => items.iter().filter_map(|v| v.as_name().map(str::to_owned)).collect(),
-      _ => return Err(PdfError::InvalidObject("bad /Filter entry".into())),
-    };
-    let mut bytes = raw.to_vec();
-    for filter in &filters {
-      if filter == "FlateDecode" || filter == "Fl" {
-        let mut decoder = flate2::read::ZlibDecoder::new(bytes.as_slice());
-        let mut decoded = Vec::new();
-        decoder
-          .read_to_end(&mut decoded)
-          .map_err(|e| PdfError::StreamDecode(e.to_string()))?;
-        bytes = decoded;
-      } else {
-        return Err(PdfError::UnsupportedFilter(filter.clone()));
-      }
-    }
-    Ok(bytes)
+    crate::filter::decode(dict, raw)
   }
 
   /// Resolve a page `/Resources` value into its font list.

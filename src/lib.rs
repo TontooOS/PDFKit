@@ -22,6 +22,7 @@
 
 pub mod document;
 pub mod error;
+pub mod filter;
 pub mod lang;
 pub mod objects;
 pub mod page;
