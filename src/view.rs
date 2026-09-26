@@ -7,10 +7,10 @@ use tontooui::renderer::text::{FontSystem, SolidBrush, draw_layout};
 use tontooui::theme::ThemeMode;
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
-use vello::peniko::{Brush, Color, ColorStop, Extend, Fill, Gradient};
+use vello::peniko::{Brush, Color, ColorStop, Extend, Fill, Gradient, ImageAlphaType, ImageData, ImageFormat};
 
 use crate::document::PdfDocument;
-use crate::graphics::{FillRule, GradientItem, PageItem, PathItem, PathSeg, Rgb};
+use crate::graphics::{FillRule, GradientItem, PageItem, PathItem, PathSeg, PlacedImage, Rgb};
 use crate::page::PdfTextRun;
 
 /// Page paper color (real viewers keep paper white in both themes;
@@ -51,6 +51,8 @@ pub struct PdfView {
   runs: Vec<RunLayout>,
   layout_scale: f32,
   dirty: bool,
+  img_page: usize,
+  images: std::collections::HashMap<(usize, usize), ImageData>,
 }
 
 impl PdfView {
@@ -68,6 +70,8 @@ impl PdfView {
       runs: Vec::new(),
       layout_scale: 0.0,
       dirty: true,
+      img_page: usize::MAX,
+      images: std::collections::HashMap::new(),
     }
   }
 
@@ -226,10 +230,14 @@ impl PdfView {
       Err(_) => return,
     };
     let (ox, oy1) = (page.origin_x, page.origin_y + page.height);
+    if self.img_page != self.page_no {
+      self.images.clear();
+      self.img_page = self.page_no;
+    }
     let mut run_idx = 0usize;
     let mut clip_depth = 0usize;
     let mut save_stack: Vec<usize> = Vec::new();
-    for item in &page.items {
+    for (item_no, item) in page.items.iter().enumerate() {
       match item {
         PageItem::Text(_) => {
           if let Some(run) = self.runs.get(run_idx) {
@@ -257,6 +265,9 @@ impl PdfView {
           }
         }
         PageItem::Gradient(shading) => self.paint_gradient(scene, shading, ox, oy1),
+        PageItem::Image(placed) => {
+          self.paint_image(scene, placed, (self.page_no, item_no), ox, oy1);
+        }
         PageItem::Save => save_stack.push(clip_depth),
         PageItem::Restore => {
           if let Some(depth) = save_stack.pop() {
@@ -266,14 +277,50 @@ impl PdfView {
             }
           }
         }
-        // XObjects resolve in M6, tiling patterns later; skipped for now.
-        PageItem::XObject(_) | PageItem::Pattern(_) => {}
+        // Tiling patterns render later; skipped items stay silent.
+        PageItem::Pattern(_) | PageItem::Skipped(_) => {}
       }
     }
     while clip_depth > 0 {
       scene.pop_layer();
       clip_depth -= 1;
     }
+  }
+
+  fn paint_image(&mut self, scene: &mut Scene, placed: &PlacedImage, key: (usize, usize), ox: f32, oy1: f32) {
+    let img = &placed.image;
+    if img.width == 0 || img.height == 0 {
+      return;
+    }
+    if !self.images.contains_key(&key) {
+      let data = ImageData {
+        data: img.rgba.clone().into(),
+        format: ImageFormat::Rgba8,
+        alpha_type: ImageAlphaType::Alpha,
+        width: img.width,
+        height: img.height,
+      };
+      self.images.insert(key, data);
+    }
+    let data = match self.images.get(&key) {
+      Some(data) => data,
+      None => return,
+    };
+    // Unit square (image space, top row first) through CTM to the page.
+    let flip = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 1.0]);
+    let ctm = Affine::new([
+      placed.ctm.a as f64,
+      placed.ctm.b as f64,
+      placed.ctm.c as f64,
+      placed.ctm.d as f64,
+      placed.ctm.e as f64,
+      placed.ctm.f as f64,
+    ]);
+    let zoom = self.zoom as f64;
+    let tx = (self.x - ox * self.zoom) as f64;
+    let ty = (self.y + oy1 * self.zoom) as f64;
+    let page = Affine::new([zoom, 0.0, 0.0, -zoom, tx, ty]);
+    scene.draw_image(data, page * ctm * flip);
   }
 
   fn paint_gradient(&self, scene: &mut Scene, shading: &GradientItem, ox: f32, oy1: f32) {

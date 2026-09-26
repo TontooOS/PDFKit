@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use crate::color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 use crate::error::{PdfError, Result};
 use crate::font::{DecoderKind, FontDecoder, apply_differences, parse_cmap};
-use crate::graphics::{ExtGState, FontInfo, ResourceProvider, Rgb, interpret, text_runs};
+use crate::graphics::{
+  ExtGState, FillRule, FontInfo, InlineVal, Matrix, MAX_FORM_DEPTH, PathItem, PathSeg, PlacedImage, ResourceProvider,
+  Rgb, XObjectResult, interpret, interpret_with, text_runs,
+};
+use crate::image::{apply_alpha, apply_constant_alpha, decode_jpeg, decode_mask_alpha, decode_samples, decode_smask_alpha};
 use crate::objects::PdfValue;
 use crate::page::PdfPage;
 use crate::parser::FileParser;
@@ -301,6 +305,270 @@ impl<'a> ResourceProvider for DocProvider<'a> {
       _ => None,
     }
   }
+
+  fn xobject(&self, name: &str, ctm: Matrix, fill: Rgb, alpha: f32, depth: u32) -> XObjectResult {
+    if depth >= MAX_FORM_DEPTH {
+      return XObjectResult::Skipped(String::from("form depth limit"));
+    }
+    // XObjects must be indirect (streams); resolve the dict chain
+    // but keep the final reference to learn the object number.
+    let entry = self
+      .parser
+      .resolve_value(&self.resources)
+      .ok()
+      .and_then(|r| r.get("XObject").cloned())
+      .and_then(|x| self.parser.resolve_value(&x).ok())
+      .and_then(|d| d.get(name).cloned());
+    let num = match entry {
+      Some(PdfValue::Ref(n, _)) => n,
+      _ => return XObjectResult::Skipped(String::from("missing XObject")),
+    };
+    let obj = match self.parser.object(num) {
+      Ok(obj) => obj,
+      Err(_) => return XObjectResult::Skipped(String::from("missing XObject")),
+    };
+    let raw = match obj.stream {
+      Some(raw) => raw,
+      None => return XObjectResult::Skipped(String::from("XObject without stream")),
+    };
+    let subtype = obj.value.get("Subtype").and_then(|v| v.as_name()).unwrap_or("").to_owned();
+    match subtype.as_str() {
+      "Form" => self.place_form(&obj.value, &raw, ctm, depth),
+      "Image" => match self.decode_image(&obj.value, &raw, fill, alpha) {
+        Some(image) => XObjectResult::Image(PlacedImage { image, ctm }),
+        None => XObjectResult::Skipped(String::from("unsupported image")),
+      },
+      _ => XObjectResult::Skipped(String::from("unknown XObject subtype")),
+    }
+  }
+
+  fn inline_image(
+    &self,
+    dict: &[(String, InlineVal)],
+    data: &[u8],
+    ctm: Matrix,
+    fill: Rgb,
+    alpha: f32,
+  ) -> XObjectResult {
+    let value = inline_dict(dict);
+    let filters = filter_names(&value);
+    if filters.iter().any(|f| f == "JPXDecode" || f == "CCITTFaxDecode" || f == "CCF" || f == "JBIG2Decode") {
+      return XObjectResult::Skipped(String::from("unsupported inline filter"));
+    }
+    if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
+      return match decode_jpeg(data) {
+        Some(mut image) => {
+          apply_constant_alpha(&mut image.rgba, alpha);
+          XObjectResult::Image(PlacedImage { image, ctm })
+        }
+        None => XObjectResult::Skipped(String::from("bad JPEG data")),
+      };
+    }
+    let samples = match crate::filter::decode(&value, data) {
+      Ok(samples) => samples,
+      Err(_) => return XObjectResult::Skipped(String::from("inline filter failed")),
+    };
+    match self.decode_image(&value, &samples, fill, alpha) {
+      Some(image) => XObjectResult::Image(PlacedImage { image, ctm }),
+      None => XObjectResult::Skipped(String::from("unsupported inline image")),
+    }
+  }
+}
+
+impl<'a> DocProvider<'a> {
+  fn place_form(&self, dict: &PdfValue, raw: &[u8], ctm: Matrix, depth: u32) -> XObjectResult {
+    let content = match crate::filter::decode(dict, raw) {
+      Ok(content) => content,
+      Err(_) => return XObjectResult::Skipped(String::from("form filter failed")),
+    };
+    let matrix = dict
+      .get("Matrix")
+      .and_then(|v| v.as_array())
+      .map(|a| {
+        let n: Vec<f32> = a.iter().filter_map(|v| v.as_number().map(|n| n as f32)).collect();
+        Matrix {
+          a: n.first().copied().unwrap_or(1.0),
+          b: n.get(1).copied().unwrap_or(0.0),
+          c: n.get(2).copied().unwrap_or(0.0),
+          d: n.get(3).copied().unwrap_or(1.0),
+          e: n.get(4).copied().unwrap_or(0.0),
+          f: n.get(5).copied().unwrap_or(0.0),
+        }
+      })
+      .unwrap_or_else(Matrix::ident);
+    let base = matrix.concat(ctm);
+    let resources = dict
+      .get("Resources")
+      .and_then(|v| self.parser.resolve_value(v).ok())
+      .unwrap_or_else(|| self.resources.clone());
+    let sub = DocProvider { parser: self.parser, resources, fonts: self.fonts.clone() };
+    let mut items = match interpret_with(&content, sub, base, depth + 1) {
+      Ok(items) => items,
+      Err(_) => return XObjectResult::Skipped(String::from("form content failed")),
+    };
+    // Clip to the form BBox inside a Save/Restore frame.
+    if let Some(bbox) = dict.get("BBox").and_then(|v| v.as_array()) {
+      let n: Vec<f32> = bbox.iter().filter_map(|v| v.as_number().map(|n| n as f32)).collect();
+      if n.len() >= 4 {
+        let (x0, y0, x1, y1) = (n[0], n[1], n[2], n[3]);
+        let mut framed = vec![
+          crate::graphics::PageItem::Save,
+          crate::graphics::PageItem::Path(PathItem {
+            subpaths: vec![vec![
+              PathSeg::Move(x0, y0),
+              PathSeg::Line(x1, y0),
+              PathSeg::Line(x1, y1),
+              PathSeg::Line(x0, y1),
+              PathSeg::Close,
+            ]],
+            ctm: base,
+            fill: None,
+            fill_alpha: 1.0,
+            stroke: None,
+            stroke_alpha: 1.0,
+            clip: Some(FillRule::NonZero),
+          }),
+        ];
+        framed.append(&mut items);
+        framed.push(crate::graphics::PageItem::Restore);
+        items = framed;
+      }
+    }
+    XObjectResult::Items(items)
+  }
+
+  fn decode_image(&self, dict: &PdfValue, raw: &[u8], fill: Rgb, alpha: f32) -> Option<crate::image::DecodedImage> {
+    // Stencil masks paint with the current fill color.
+    if dict.get("ImageMask").and_then(|v| v.as_number()).is_some_and(|v| v != 0.0) {
+      let samples = crate::filter::decode(dict, raw).ok()?;
+      let plane = decode_mask_alpha(dict, &samples)?;
+      let width = dict.get("Width").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+      let height = dict.get("Height").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
+      let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+      for a in &plane {
+        rgba.push((fill.r.clamp(0.0, 1.0) * 255.0) as u8);
+        rgba.push((fill.g.clamp(0.0, 1.0) * 255.0) as u8);
+        rgba.push((fill.b.clamp(0.0, 1.0) * 255.0) as u8);
+        rgba.push(*a);
+      }
+      let mut image = crate::image::DecodedImage { width, height, rgba, interpolate: false };
+      apply_constant_alpha(&mut image.rgba, alpha);
+      return Some(image);
+    }
+    let filters = stream_filters(dict);
+    if filters.iter().any(|f| f == "JPXDecode" || f == "CCITTFaxDecode" || f == "CCF" || f == "JBIG2Decode") {
+      return None;
+    }
+    if filters.iter().any(|f| f == "DCTDecode" || f == "DCT") {
+      let mut image = decode_jpeg(raw)?;
+      let (w, h) = (image.width, image.height);
+      let want_w = dict.get("Width").and_then(|v| v.as_number()).unwrap_or(w as f64) as u32;
+      let want_h = dict.get("Height").and_then(|v| v.as_number()).unwrap_or(h as f64) as u32;
+      if want_w != 0 && want_h != 0 && (want_w != w || want_h != h) {
+        return None;
+      }
+      if let Some(smask) = self.smask_alpha(dict) {
+        if smask.len() == (w * h) as usize {
+          apply_alpha(&mut image.rgba, &smask);
+        }
+      }
+      apply_constant_alpha(&mut image.rgba, alpha);
+      return Some(image);
+    }
+    let samples = crate::filter::decode(dict, raw).ok()?;
+    let map_space = dict.get("ColorSpace").and_then(|v| self.parser.resolve_value(v).ok());
+    let mut image = decode_samples(dict, &samples, &|comps| {
+      map_space.as_ref().and_then(|space| self.eval_space(space, comps))
+    })?;
+    if let Some(smask) = self.smask_alpha(dict) {
+      if smask.len() == (image.width * image.height) as usize {
+        apply_alpha(&mut image.rgba, &smask);
+      }
+    }
+    apply_constant_alpha(&mut image.rgba, alpha);
+    Some(image)
+  }
+
+  fn smask_alpha(&self, dict: &PdfValue) -> Option<Vec<u8>> {
+    let target = dict.get("SMask")?;
+    let num = target.as_ref().map(|(n, _)| n)?;
+    let (sdict, raw) = self.parser.decoded_stream(num).ok()?;
+    let samples = crate::filter::decode(&sdict, &raw).ok()?;
+    let map_space = sdict.get("ColorSpace").and_then(|v| self.parser.resolve_value(v).ok());
+    decode_smask_alpha(&sdict, &samples, &|comps| {
+      map_space.as_ref().and_then(|space| self.eval_space(space, comps))
+    })
+  }
+}
+
+/// Filter names of a stream dict (direct only; resolved by callers).
+fn stream_filters(dict: &PdfValue) -> Vec<String> {
+  match dict.get("Filter") {
+    None | Some(PdfValue::Null) => vec![],
+    Some(PdfValue::Name(name)) => vec![filter_full_name(name)],
+    Some(PdfValue::Array(items)) => {
+      items.iter().filter_map(|v| v.as_name().map(filter_full_name)).collect()
+    }
+    _ => vec![],
+  }
+}
+
+fn filter_full_name(name: &str) -> String {
+  match name {
+    "AHx" => "ASCIIHexDecode",
+    "A85" => "ASCII85Decode",
+    "LZW" => "LZWDecode",
+    "Fl" => "FlateDecode",
+    "RL" => "RunLengthDecode",
+    "CCF" => "CCITTFaxDecode",
+    "DCT" => "DCTDecode",
+    other => other,
+  }
+  .into()
+}
+
+fn filter_names(value: &PdfValue) -> Vec<String> {
+  stream_filters(value)
+}
+
+/// Build a stream-style dict value from neutral inline-image entries.
+fn inline_dict(dict: &[(String, InlineVal)]) -> PdfValue {
+  let mut entries = Vec::new();
+  for (key, value) in dict {
+    let full = match key.as_str() {
+      "BPC" => "BitsPerComponent",
+      "CS" => "ColorSpace",
+      "D" => "Decode",
+      "DP" => "DecodeParms",
+      "F" => "Filter",
+      "H" => "Height",
+      "W" => "Width",
+      "I" => "Interpolate",
+      "IM" => "ImageMask",
+      other => other,
+    };
+    entries.push((full.into(), inline_value(value)));
+  }
+  PdfValue::Dict(entries)
+}
+
+fn inline_value(value: &InlineVal) -> PdfValue {
+  match value {
+    InlineVal::Name(n) => match n.as_str() {
+      "G" => PdfValue::Name("DeviceGray".into()),
+      "RGB" => PdfValue::Name("DeviceRGB".into()),
+      "CMYK" => PdfValue::Name("DeviceCMYK".into()),
+      "I" => PdfValue::Name("Indexed".into()),
+      _ => PdfValue::Name(inline_filter_value(n)),
+    },
+    InlineVal::Num(n) => PdfValue::Number(*n),
+    InlineVal::Array(items) => PdfValue::Array(items.iter().map(inline_value).collect()),
+    InlineVal::Str(bytes) => PdfValue::Str(bytes.clone()),
+  }
+}
+
+fn inline_filter_value(name: &str) -> String {
+  filter_full_name(name)
 }
 
 impl<'a> DocProvider<'a> {
@@ -577,6 +845,76 @@ mod tests {
     assert_eq!(page.runs[0].text, "æ");
     // Advance uses the real width: 500/1000 * 12pt = 6pt.
     assert_eq!(page.runs[1].x, 72.0 + 6.0);
+  }
+
+  #[test]
+  fn form_xobject_recursion() {
+    let form_content = b"BT /F1 10 Tf 0 0 Td (InForm) Tj ET 0 0 50 50 re f";
+    let content = b"q 2 0 0 2 0 0 cm /Fm1 Do Q";
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 6 0 R >> /XObject << /Fm1 5 0 R >> >> >>".to_vec(),
+      [b"<< /Length ".to_vec(), content.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), content.to_vec(), b"\nendstream".to_vec()].concat(),
+      [
+        b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100] /Matrix [1 0 0 1 10 20] /Resources << /Font << /F1 6 0 R >> >> /Length ".to_vec(),
+        form_content.len().to_string().into_bytes(),
+        b" >>\nstream\n".to_vec(),
+        form_content.to_vec(),
+        b"\nendstream".to_vec(),
+      ]
+      .concat(),
+      b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    let doc = assemble(objects);
+    let page = doc.page(0).unwrap();
+    assert!(page.text().contains("InForm"));
+    // Form origin (10, 20) through the page scale (2x) lands at (20, 40).
+    let run = page.runs.iter().find(|r| r.text == "InForm").unwrap();
+    assert_eq!((run.x, run.y), (20.0, 40.0));
+    assert!(page.items.iter().any(|i| matches!(i, crate::graphics::PageItem::Path(_))));
+    assert!(page.items.iter().any(|i| matches!(i, crate::graphics::PageItem::Save)));
+  }
+
+  #[test]
+  fn inline_image_decodes() {
+    let content = b"q 10 0 0 10 100 500 cm BI /W 2 /H 1 /CS /G /BPC 1 ID \xC0 EI Q";
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>".to_vec(),
+      [b"<< /Length ".to_vec(), content.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), content.to_vec(), b"\nendstream".to_vec()].concat(),
+    ];
+    let doc = assemble(objects);
+    let page = doc.page(0).unwrap();
+    let image = page.items.iter().find_map(|i| match i {
+      crate::graphics::PageItem::Image(placed) => Some(placed),
+      _ => None,
+    });
+    let placed = image.expect("inline image item");
+    assert_eq!((placed.image.width, placed.image.height), (2, 1));
+    assert_eq!(&placed.image.rgba[0..4], &[255, 255, 255, 255]);
+  }
+
+  fn assemble(objects: Vec<Vec<u8>>) -> PdfDocument {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+      offsets.push(pdf.len());
+      pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+      pdf.extend_from_slice(body);
+      pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+      pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(xref.to_string().as_bytes());
+    pdf.extend_from_slice(b"\n%%EOF");
+    PdfDocument::load_bytes(pdf).unwrap()
   }
 
   #[test]

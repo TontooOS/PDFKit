@@ -23,6 +23,7 @@ pub mod error;
 pub mod filter;
 pub mod font;
 pub mod graphics;
+pub mod image;
 pub mod lang;
 pub mod objects;
 pub mod page;
@@ -34,9 +35,11 @@ pub use document::PdfDocument;
 pub use font::{CMap, DecoderKind, FontDecoder, RangeDst, apply_differences, glyph_name_to_char, parse_cmap};
 pub use error::{PdfError, Result};
 pub use graphics::{
-  ExtGState, FillRule, FontInfo, GradientItem, MapResources, Matrix, NoResources, PageItem, PathItem, PathSeg,
-  ResourceProvider, Rgb, StrokeStyle, cmyk_to_rgb, interpret, text_runs,
+  ExtGState, FillRule, FontInfo, GradientItem, InlineVal, MapResources, Matrix, MAX_FORM_DEPTH, NoResources, PageItem,
+  PathItem, PathSeg, PlacedImage, ResourceProvider, Rgb, StrokeStyle, XObjectResult, cmyk_to_rgb, interpret,
+  interpret_with, text_runs,
 };
+pub use image::{DecodedImage, apply_alpha, apply_constant_alpha, decode_jpeg, decode_mask_alpha, decode_samples, decode_smask_alpha};
 pub use page::{PdfPage, PdfTextRun, decode_text};
 pub use parser::{FileParser, PageFont, ParsedPage};
 pub use view::{PdfView, PDF_BG_DARK, PDF_BG_LIGHT, PDF_PAPER, PDF_TEXT_DARK, PDF_TEXT_LIGHT};

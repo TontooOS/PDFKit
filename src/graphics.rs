@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::color::{ResolvedPattern, ResolvedShading};
 use crate::error::{PdfError, Result};
 use crate::font::FontDecoder;
+use crate::image::DecodedImage;
 use crate::page::PdfTextRun;
 
 /// 2D affine matrix `[a b c d e f]` in PDF row-vector convention:
@@ -225,15 +226,63 @@ pub enum PageItem {
   Text(PdfTextRun),
   Path(PathItem),
   Gradient(GradientItem),
-  /// Named XObject (`Do`); resolved to form/image content in M6.
-  XObject(String),
+  Image(PlacedImage),
   /// Pattern reference (tiling renders in a later milestone).
   Pattern(String),
+  /// Skipped content with a reason (unsupported filter, depth limit).
+  Skipped(String),
   /// Graphics state push (`q`); bounds clip lifetime for the view.
   Save,
   /// Graphics state pop (`Q`).
   Restore,
 }
+
+/// An image placed through a CTM snapshot (unit square mapping).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacedImage {
+  /// Decoded RGBA pixels.
+  pub image: DecodedImage,
+  /// CTM mapping the unit square to user space.
+  pub ctm: Matrix,
+}
+
+/// Result of resolving an XObject or inline image.
+#[derive(Debug, Clone, PartialEq)]
+pub enum XObjectResult {
+  /// Spliced items (form content with its own Save/Restore frame).
+  Items(Vec<PageItem>),
+  /// A placed raster image.
+  Image(PlacedImage),
+  /// Skipped with a reason.
+  Skipped(String),
+}
+
+/// Neutral inline-image dict value for providers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InlineVal {
+  Name(String),
+  Num(f64),
+  Array(Vec<InlineVal>),
+  Str(Vec<u8>),
+}
+
+impl InlineVal {
+  /// Convert a content token (dicts become unsupported markers).
+  fn from_token(token: &Token) -> Self {
+    match token {
+      Token::Name(n) => Self::Name(n.clone()),
+      Token::Num(n) => Self::Num(*n),
+      Token::Array(items) => Self::Array(items.iter().map(Self::from_token).collect()),
+      Token::Str(bytes) => Self::Str(bytes.clone()),
+      Token::Dict(_) => Self::Name(String::from("<dict>")),
+      Token::InlineImage { .. } => Self::Name(String::from("<image>")),
+      Token::Op(op) => Self::Name(op.clone()),
+    }
+  }
+}
+
+/// Maximum form XObject nesting (guards cyclic forms).
+pub const MAX_FORM_DEPTH: u32 = 8;
 
 /// Resources a content stream can name. Implemented by the document
 /// layer on top of `FileParser`.
@@ -256,6 +305,22 @@ pub trait ResourceProvider {
   /// Resolve a pattern resource for `SCN`/`scn`.
   fn pattern(&self, _name: &str) -> Option<ResolvedPattern> {
     None
+  }
+  /// Resolve an XObject for `Do` with the current CTM, fill paint
+  /// and alpha. `depth` counts form nesting (see `MAX_FORM_DEPTH`).
+  fn xobject(&self, _name: &str, _ctm: Matrix, _fill: Rgb, _alpha: f32, _depth: u32) -> XObjectResult {
+    XObjectResult::Skipped(String::from("no resources"))
+  }
+  /// Resolve an inline image (`BI..EI`) with neutral dict values.
+  fn inline_image(
+    &self,
+    _dict: &[(String, InlineVal)],
+    _data: &[u8],
+    _ctm: Matrix,
+    _fill: Rgb,
+    _alpha: f32,
+  ) -> XObjectResult {
+    XObjectResult::Skipped(String::from("no resources"))
   }
 }
 
@@ -753,12 +818,20 @@ struct Interp<R: ResourceProvider> {
   path: Vec<Vec<PathSeg>>,
   pending_clip: Option<FillRule>,
   compat_depth: u32,
+  depth: u32,
   items: Vec<PageItem>,
 }
 
 /// Interpret a decoded content stream into page items.
 pub fn interpret<R: ResourceProvider>(content: &[u8], res: R) -> Result<Vec<PageItem>> {
-  let mut it = Interp { res, stack: vec![State::new()], path: Vec::new(), pending_clip: None, compat_depth: 0, items: Vec::new() };
+  interpret_with(content, res, Matrix::ident(), 0)
+}
+
+/// Interpret with a base CTM (form XObjects) and nesting depth.
+pub fn interpret_with<R: ResourceProvider>(content: &[u8], res: R, base_ctm: Matrix, depth: u32) -> Result<Vec<PageItem>> {
+  let mut base = State::new();
+  base.ctm = base_ctm;
+  let mut it = Interp { res, stack: vec![base], path: Vec::new(), pending_clip: None, compat_depth: 0, depth, items: Vec::new() };
   it.run(content)?;
   Ok(it.items)
 }
@@ -1165,7 +1238,13 @@ impl<R: ResourceProvider> Interp<R> {
       // XObjects, patterns and shading.
       "Do" => {
         if let Some(name) = ops.first().and_then(token_name) {
-          self.items.push(PageItem::XObject(name.to_owned()));
+          let st = self.state();
+          let (ctm, fill, alpha, depth) = (st.ctm, st.fill_rgb, st.fill_alpha, self.depth);
+          match self.res.xobject(name, ctm, fill, alpha, depth) {
+            XObjectResult::Items(mut sub) => self.items.append(&mut sub),
+            XObjectResult::Image(placed) => self.items.push(PageItem::Image(placed)),
+            XObjectResult::Skipped(reason) => self.items.push(PageItem::Skipped(reason)),
+          }
         }
       }
       "sh" => {
@@ -1381,9 +1460,15 @@ impl<R: ResourceProvider> Interp<R> {
     Ok(())
   }
 
-  fn inline_image(&mut self, _dict: Vec<(String, Token)>, _data: Vec<u8>) -> Result<()> {
-    // Decoded and drawn in M6; counted here so nothing is lost silently.
-    self.items.push(PageItem::XObject(String::from("<inline>")));
+  fn inline_image(&mut self, dict: Vec<(String, Token)>, data: Vec<u8>) -> Result<()> {
+    let st = self.state();
+    let (ctm, fill, alpha) = (st.ctm, st.fill_rgb, st.fill_alpha);
+    let neutral: Vec<(String, InlineVal)> = dict.into_iter().map(|(k, v)| (k, InlineVal::from_token(&v))).collect();
+    match self.res.inline_image(&neutral, &data, ctm, fill, alpha) {
+      XObjectResult::Items(mut sub) => self.items.append(&mut sub),
+      XObjectResult::Image(placed) => self.items.push(PageItem::Image(placed)),
+      XObjectResult::Skipped(reason) => self.items.push(PageItem::Skipped(reason)),
+    }
     Ok(())
   }
 }
