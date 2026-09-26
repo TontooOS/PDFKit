@@ -18,6 +18,7 @@
 //! ```
 
 pub mod annot;
+pub mod crypt;
 pub mod document;
 pub mod color;
 pub mod error;
@@ -33,6 +34,7 @@ pub mod view;
 
 pub use color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 pub use annot::{Annotation, DocInfo, LinkTarget, Outline, parse_annotation, parse_info, parse_outlines, pdfdoc_to_string};
+pub use crypt::{Cfm, CryptState, PADDING, aes128_cbc_decrypt, aes128_cbc_encrypt, aes256_cbc_decrypt, md5sum, pdf20_hash, rc4, sha256sum};
 pub use document::PdfDocument;
 pub use font::{CMap, DecoderKind, FontDecoder, RangeDst, apply_differences, glyph_name_to_char, parse_cmap};
 pub use error::{PdfError, Result};

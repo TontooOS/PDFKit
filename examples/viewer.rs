@@ -8,7 +8,7 @@ use vello::peniko::Color;
 
 /// Manual test viewer for PDFKit.
 ///
-/// Usage: `cargo run --example viewer -- /path/to/file.pdf`
+/// Usage: `cargo run --example viewer -- /path/to/file.pdf [password]`
 /// Arrow keys turn pages, the mouse wheel zooms.
 struct Viewer {
   view: PdfView,
@@ -16,8 +16,9 @@ struct Viewer {
 }
 
 impl Viewer {
-  fn new(path: &str) -> Result<Self, String> {
-    let doc = PdfDocument::load_file(path).map_err(|e| format!("cannot open '{path}': {e}"))?;
+  fn new(path: &str, password: &str) -> Result<Self, String> {
+    let doc = PdfDocument::load_file_with_password(path, password)
+      .map_err(|e| format!("cannot open '{path}': {e}"))?;
     let mut view = PdfView::new(doc);
     view.set_theme(ThemeMode::Dark);
     Ok(Self { view, bg: Color::from_rgb8(27, 32, 34) })
@@ -62,11 +63,12 @@ impl App for Viewer {
 
 fn main() {
   let path = std::env::args().nth(1).unwrap_or_default();
+  let password = std::env::args().nth(2).unwrap_or_default();
   if path.is_empty() {
-    eprintln!("usage: viewer <file.pdf>");
+    eprintln!("usage: viewer <file.pdf> [password]");
     std::process::exit(2);
   }
-  match Viewer::new(&path) {
+  match Viewer::new(&path, &password) {
     Ok(app) => {
       if let Err(err) = run("PDF Viewer", 720, 900, app) {
         eprintln!("error: {err}");

@@ -28,14 +28,26 @@ pub struct PdfDocument {
 impl PdfDocument {
   /// Parse a document from memory.
   pub fn load_bytes(data: Vec<u8>) -> Result<Self> {
-    let parser = FileParser::new(data)?;
+    Self::load_bytes_with_password(data, "")
+  }
+
+  /// Parse a document from memory with a password (may be empty).
+  /// Encrypted files without a usable password yield `NeedsPassword`
+  /// (empty password) or `WrongPassword`.
+  pub fn load_bytes_with_password(data: Vec<u8>, password: &str) -> Result<Self> {
+    let parser = FileParser::new_with_password(data, password.as_bytes())?;
     Self::from_parser(&parser)
   }
 
   /// Parse a document from a file path.
   pub fn load_file(path: &str) -> Result<Self> {
+    Self::load_file_with_password(path, "")
+  }
+
+  /// Parse a document from a file path with a password.
+  pub fn load_file_with_password(path: &str, password: &str) -> Result<Self> {
     let data = std::fs::read(path).map_err(|e| PdfError::InvalidObject(e.to_string()))?;
-    Self::load_bytes(data)
+    Self::load_bytes_with_password(data, password)
   }
 
   fn from_parser(parser: &FileParser) -> Result<Self> {

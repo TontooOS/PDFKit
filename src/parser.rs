@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+use crate::crypt::CryptState;
 use crate::error::{PdfError, Result};
 use crate::objects::{ObjectParser, PdfValue};
 
@@ -54,12 +55,19 @@ pub struct FileParser {
   compressed: HashMap<u32, (u32, usize)>,
   objstm_cache: RefCell<HashMap<u32, Vec<(u32, PdfValue)>>>,
   trailer: PdfValue,
+  crypt: Option<CryptState>,
 }
 
 impl FileParser {
   /// Parse the structure of `data`. Content streams stay encoded
-  /// until a page is resolved.
+  /// until a page is resolved. Encrypted files open with the empty
+  /// password; `NeedsPassword` surfaces otherwise.
   pub fn new(data: Vec<u8>) -> Result<Self> {
+    Self::new_with_password(data, b"")
+  }
+
+  /// Parse with an explicit password (may be empty).
+  pub fn new_with_password(data: Vec<u8>, password: &[u8]) -> Result<Self> {
     if data.is_empty() {
       return Err(PdfError::Empty);
     }
@@ -72,6 +80,7 @@ impl FileParser {
       compressed: HashMap::new(),
       objstm_cache: RefCell::new(HashMap::new()),
       trailer: PdfValue::Null,
+      crypt: None,
     };
     parser.read_xref()?;
     if parser.offsets.is_empty() && parser.compressed.is_empty() {
@@ -80,7 +89,49 @@ impl FileParser {
     if parser.offsets.is_empty() && parser.compressed.is_empty() {
       return Err(PdfError::XrefNotFound);
     }
+    parser.setup_crypt(password)?;
     Ok(parser)
+  }
+
+  /// Open the `/Encrypt` dict when present. An empty password that
+  /// fails authentication surfaces as `NeedsPassword` so callers can
+  /// prompt; explicit passwords surface `WrongPassword`.
+  fn setup_crypt(&mut self, password: &[u8]) -> Result<()> {
+    let entry = match self.trailer.get("Encrypt") {
+      None | Some(PdfValue::Null) => return Ok(()),
+      Some(entry) => entry.clone(),
+    };
+    let encrypt_num = entry.as_ref().map(|(n, _)| n).unwrap_or(0);
+    let dict = self.resolve(&entry)?;
+    let id0 = match self.trailer.get("ID").and_then(|v| v.as_array()).and_then(|a| a.first()) {
+      Some(PdfValue::Str(bytes)) | Some(PdfValue::Hex(bytes)) => bytes.clone(),
+      _ => {
+        if password.is_empty() {
+          return Err(PdfError::NeedsPassword);
+        } else {
+          return Err(PdfError::WrongPassword);
+        }
+      }
+    };
+    match CryptState::open(&dict, &id0, password, encrypt_num) {
+      Ok(state) => {
+        self.crypt = Some(state);
+        Ok(())
+      }
+      Err(PdfError::WrongPassword) => {
+        if password.is_empty() {
+          Err(PdfError::NeedsPassword)
+        } else {
+          Err(PdfError::WrongPassword)
+        }
+      }
+      Err(other) => Err(other),
+    }
+  }
+
+  /// Active decryption state, if the file is encrypted.
+  pub fn crypt(&self) -> Option<&CryptState> {
+    self.crypt.as_ref()
   }
 
   fn tail_text(&self, len: usize) -> &[u8] {
@@ -364,6 +415,21 @@ impl FileParser {
     let after = p.offset();
     let rest = &self.data[offset + after..];
     let stream = self.stream_body(&value, rest)?;
+    let (value, stream) = match &self.crypt {
+      Some(crypt) => {
+        let value = crypt.decrypt_value(value, num, gen);
+        let stream = match stream {
+          Some(raw) => Some(
+            crypt
+              .decrypt_stream(&raw, num, gen)
+              .ok_or_else(|| PdfError::StreamDecode(format!("cannot decrypt object {num}")))?,
+          ),
+          None => None,
+        };
+        (value, stream)
+      }
+      None => (value, stream),
+    };
     Ok(IndirectObject { num, gen, value, stream })
   }
 
@@ -400,7 +466,14 @@ impl FileParser {
       }
       let mut body = ObjectParser::new(&bytes[at..]);
       match body.parse_value()? {
-        Some(value) => out.push((num, value)),
+        Some(value) => {
+          // Inner strings use the containing stream's number.
+          let value = match &self.crypt {
+            Some(crypt) => crypt.decrypt_value(value, stm, 0),
+            None => value,
+          };
+          out.push((num, value));
+        }
         None => return Err(PdfError::InvalidObject("empty ObjStm entry".into())),
       }
     }

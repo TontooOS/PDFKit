@@ -40,6 +40,8 @@ when a file is not valid JSON.
 | `pdfkit.view.zoom_out` | `Zoom out` | `Verkleinern` |
 | `pdfkit.error.load_failed` | `Could not open PDF: '{}'` | `PDF konnte nicht geoeffnet werden: '{}'` |
 | `pdfkit.error.no_text` | `This page contains no text yet` | `Diese Seite enthaelt noch keinen Text` |
+| `pdfkit.error.needs_password` | `This PDF is encrypted, a password is required` | `Dieses PDF ist verschluesselt, ein Passwort wird benoetigt` |
+| `pdfkit.error.wrong_password` | `Wrong password` | `Falsches Passwort` |
 
 ## Usage / Example
 

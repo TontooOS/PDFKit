@@ -1,8 +1,9 @@
 # PDFKit – Wiki
 
 PDFKit is the native PDF document model and viewer for TontooOS. It parses
-real PDF files into positioned text runs and renders them as a TontooUI
-`View` through the shared `FontSystem` (SF Pro, Parley layout, Vello glyphs).
+real PDF files (structure, filters, encryption, graphics, fonts, images,
+annotations) into a vector/text page model and renders it as a TontooUI
+`View` through the shared `FontSystem` (SF Pro, Parley layout, Vello).
 
 - Repository: https://github.com/TontooOS/PDFKit
 - License: TCL
@@ -14,8 +15,13 @@ real PDF files into positioned text runs and renders them as a TontooUI
 |---|---|---|
 | Main index | [MAIN.md](MAIN.md) | This page |
 | Rules | [RULE.md](RULE.md) | Development and usage rules |
-| PdfDocument | [PdfDocument.md](PdfDocument.md) | File parsing, page tree and text runs |
-| PdfView | [PdfView.md](PdfView.md) | TontooUI view with page, zoom and theme |
+| PdfDocument | [PdfDocument.md](PdfDocument.md) | Loading, pages, encryption, outlines, metadata |
+| PdfView | [PdfView.md](PdfView.md) | TontooUI view with page, zoom and annotations |
+| DocumentStructure | [DocumentStructure.md](DocumentStructure.md) | Header, xref, object streams, filters |
+| Graphics | [Graphics.md](Graphics.md) | Paths, colors, transparency, patterns, shadings |
+| Fonts | [Fonts.md](Fonts.md) | Encodings, ToUnicode CMaps, CID fonts |
+| Images | [Images.md](Images.md) | Image and form XObjects, inline images, masks |
+| Annotations | [Annotations.md](Annotations.md) | Annots, links, outlines, marked content |
 | Language | [Language.md](Language.md) | `lang/en_us.json` and `lang/de_de.json` strings |
 
 ## Quick Start
@@ -27,9 +33,20 @@ let doc = PdfDocument::load_file("/path/to/file.pdf").unwrap();
 let view = PdfView::new(doc);
 ```
 
+Encrypted files open with a password:
+
+```rust
+use pdfkit::PdfDocument;
+
+let doc = PdfDocument::load_file_with_password("/path/to/file.pdf", "userpass").unwrap();
+```
+
 See [PdfDocument.md](PdfDocument.md) for details.
 
 ## Changelog
 
+- 2026-09-26: Full standard pass M1-M8: filters, xref streams, graphics,
+  transparency, fonts, images, annotations, encryption (V1-V5); new wiki
+  pages for every feature.
 - 2026-09-26: Initial wiki, text-only document model (`PdfDocument`,
   `PdfPage`, `PdfTextRun`) and `PdfView` (page, zoom, theme, Vello text).

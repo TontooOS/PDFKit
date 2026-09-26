@@ -6,5 +6,7 @@
   "pdfkit.view.zoom_in": "Vergroessern",
   "pdfkit.view.zoom_out": "Verkleinern",
   "pdfkit.error.load_failed": "PDF konnte nicht geoeffnet werden: '{}'",
-  "pdfkit.error.no_text": "Diese Seite enthaelt noch keinen Text"
+  "pdfkit.error.no_text": "Diese Seite enthaelt noch keinen Text",
+  "pdfkit.error.needs_password": "Dieses PDF ist verschluesselt, ein Passwort wird benoetigt",
+  "pdfkit.error.wrong_password": "Falsches Passwort"
 }

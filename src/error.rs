@@ -28,6 +28,12 @@ pub enum PdfError {
   ContentParse(String),
   /// A `lang/` lookup file failed to parse; carries a detail message.
   Lang(String),
+  /// The file is encrypted; open it with a password.
+  NeedsPassword,
+  /// The password does not open the file.
+  WrongPassword,
+  /// Unsupported crypt filter or handler; carries a detail message.
+  UnsupportedCrypt(String),
 }
 
 impl fmt::Display for PdfError {
@@ -44,6 +50,9 @@ impl fmt::Display for PdfError {
       Self::PageOutOfRange(i) => write!(f, "page index out of range: {i}"),
       Self::ContentParse(detail) => write!(f, "content parse failed: {detail}"),
       Self::Lang(detail) => write!(f, "language file error: {detail}"),
+      Self::NeedsPassword => write!(f, "file is encrypted, password required"),
+      Self::WrongPassword => write!(f, "wrong password"),
+      Self::UnsupportedCrypt(detail) => write!(f, "unsupported encryption: {detail}"),
     }
   }
 }
