@@ -18,6 +18,7 @@
 //! ```
 
 pub mod document;
+pub mod color;
 pub mod error;
 pub mod filter;
 pub mod graphics;
@@ -27,11 +28,12 @@ pub mod page;
 pub mod parser;
 pub mod view;
 
+pub use color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 pub use document::PdfDocument;
 pub use error::{PdfError, Result};
 pub use graphics::{
-  FillRule, FontInfo, MapResources, Matrix, NoResources, PageItem, PathItem, PathSeg, ResourceProvider, Rgb,
-  StrokeStyle, cmyk_to_rgb, interpret, text_runs,
+  ExtGState, FillRule, FontInfo, GradientItem, MapResources, Matrix, NoResources, PageItem, PathItem, PathSeg,
+  ResourceProvider, Rgb, StrokeStyle, cmyk_to_rgb, interpret, text_runs,
 };
 pub use page::{PdfPage, PdfTextRun, decode_text};
 pub use parser::{FileParser, PageFont, ParsedPage};

@@ -522,13 +522,13 @@ impl FileParser {
     match contents {
       None => Ok(out),
       Some(PdfValue::Ref(num, _)) => {
-        out.extend(self.decoded_stream(*num)?);
+        out.extend(self.decoded_content(*num)?);
         Ok(out)
       }
       Some(PdfValue::Array(items)) => {
         for item in items {
           if let Some((num, _)) = item.as_ref() {
-            let bytes = self.decoded_stream(num)?;
+            let bytes = self.decoded_content(num)?;
             out.extend(bytes);
             out.push(b'\n');
           }
@@ -539,19 +539,13 @@ impl FileParser {
         let resolved = self.resolve(other)?;
         match resolved {
           PdfValue::Ref(num, _) => {
-            out.extend(self.decoded_stream(num)?);
+            out.extend(self.decoded_content(num)?);
             Ok(out)
           }
           _ => Err(PdfError::InvalidObject("/Contents must be a stream reference".into())),
         }
       }
     }
-  }
-
-  fn decoded_stream(&self, num: u32) -> Result<Vec<u8>> {
-    let obj = self.object(num)?;
-    let raw = obj.stream.ok_or_else(|| PdfError::InvalidObject(format!("object {num} is not a stream")))?;
-    Self::decode_stream(&obj.value, &raw)
   }
 
   /// Decode a stream body honoring `/Filter` and `/DecodeParms`
@@ -588,6 +582,27 @@ impl FileParser {
       fonts.push(PageFont { resource: resource.clone(), base_font: base });
     }
     Ok(fonts)
+  }
+
+  /// Look up `resources /Sub /Name`, resolving references.
+  /// Used for `ExtGState`, `XObject`, `ColorSpace`, `Pattern` and `Shading`.
+  pub fn resource_entry(&self, resources: &PdfValue, sub: &str, name: &str) -> Option<PdfValue> {
+    let sub_dict = resources.get(sub)?;
+    let resolved = self.resolve(sub_dict).ok()?;
+    let entry = resolved.get(name)?;
+    self.resolve(entry).ok()
+  }
+
+  /// Decode stream object `num` into its dict plus decoded bytes.
+  pub fn decoded_stream(&self, num: u32) -> Result<(PdfValue, Vec<u8>)> {
+    let obj = self.object(num)?;
+    let raw = obj.stream.ok_or_else(|| PdfError::InvalidObject(format!("object {num} is not a stream")))?;
+    let bytes = Self::decode_stream(&obj.value, &raw)?;
+    Ok((obj.value, bytes))
+  }
+
+  fn decoded_content(&self, num: u32) -> Result<Vec<u8>> {
+    Ok(self.decoded_stream(num)?.1)
   }
 
   /// Number of indirect objects found (structure info for tests).
@@ -665,7 +680,7 @@ pub(crate) mod tests {
     let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     enc.write_all(b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET").unwrap();
     let compressed = enc.finish().unwrap();
-    let mut pdf = minimal_pdf(&[]);
+    let pdf = minimal_pdf(&[]);
     let _ = pdf;
     let inner: Vec<u8> = [
       b"<< /Length ".to_vec(),
@@ -697,7 +712,7 @@ pub(crate) mod tests {
     let mut pdf = Vec::new();
     pdf.extend_from_slice(b"%PDF-1.5\n");
     let mut offsets: Vec<usize> = Vec::new();
-    let mut emit = |pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, num: u32, body: &[u8]| {
+    let emit = |pdf: &mut Vec<u8>, offsets: &mut Vec<usize>, num: u32, body: &[u8]| {
       offsets.push(pdf.len());
       pdf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
       pdf.extend_from_slice(body);

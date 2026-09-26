@@ -193,7 +193,7 @@ pub fn ascii85_decode(data: &[u8]) -> Result<Vec<u8>> {
   let mut out = Vec::new();
   let mut group: Vec<u32> = Vec::with_capacity(5);
   let mut i = 0;
-  let mut stop = data.len();
+  let stop = data.len();
   if data.starts_with(b"<~") {
     i = 2;
   }
@@ -472,7 +472,7 @@ mod tests {
     let mut out: Vec<u8> = Vec::new();
     let mut buf = 0u32;
     let mut nbits = 0u32;
-    let mut emit = |code: u32, width: u32, out: &mut Vec<u8>, buf: &mut u32, nbits: &mut u32| {
+    let emit = |code: u32, width: u32, out: &mut Vec<u8>, buf: &mut u32, nbits: &mut u32| {
       *buf = ((*buf << width) | code) & 0xFFFF_FFFF;
       *nbits += width;
       while *nbits >= 8 {

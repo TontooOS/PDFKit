@@ -28,6 +28,8 @@ pub struct PdfTextRun {
   pub dir_x: f32,
   /// Normalized text x-axis direction (for future underline/selection).
   pub dir_y: f32,
+  /// Fill alpha from `ca` (`1.0` opaque).
+  pub alpha: f32,
 }
 
 /// A fully interpreted page: size plus the vector/text item model.

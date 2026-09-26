@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
+use crate::color::{ResolvedPattern, ResolvedShading};
 use crate::error::{PdfError, Result};
-use crate::objects::ObjectParser;
 use crate::page::{PdfTextRun, decode_text};
 
 /// 2D affine matrix `[a b c d e f]` in PDF row-vector convention:
@@ -137,10 +137,53 @@ pub struct PathItem {
   pub ctm: Matrix,
   /// Fill paint and rule (`S` never sets this).
   pub fill: Option<(Rgb, FillRule)>,
+  /// Fill alpha from `ca` (`1.0` opaque).
+  pub fill_alpha: f32,
   /// Stroke paint and style.
   pub stroke: Option<(Rgb, StrokeStyle)>,
+  /// Stroke alpha from `CA` (`1.0` opaque).
+  pub stroke_alpha: f32,
   /// Clip rule when `W`/`W*` preceded the paint operator.
   pub clip: Option<FillRule>,
+}
+
+/// An axial or radial shading resolved for the view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientItem {
+  /// CTM snapshot when the shading was painted.
+  pub ctm: Matrix,
+  /// Axial `(x0, y0, x1, y1)` or radial `(x0, y0, r0, x1, y1, r1)` coords.
+  pub coords: Vec<f32>,
+  /// True for radial, false for axial.
+  pub radial: bool,
+  /// Gradient stops (offset `0.0..=1.0`, sRGB).
+  pub stops: Vec<(f32, Rgb)>,
+  /// Extend flags beyond `[0, 1]`.
+  pub extend: [bool; 2],
+}
+
+/// ExtGState parameters applied by the `gs` operator (ISO 32000 8.4.5).
+/// Blend modes, overprint and soft masks parse but render as normal
+/// opaque paint (documented gap); line attributes and constant alpha
+/// apply fully.
+#[derive(Debug, Clone, Default)]
+pub struct ExtGState {
+  /// Line width (`LW`).
+  pub lw: Option<f32>,
+  /// Line cap (`LC`).
+  pub lc: Option<u8>,
+  /// Line join (`LJ`).
+  pub join: Option<u8>,
+  /// Miter limit (`ML`).
+  pub ml: Option<f32>,
+  /// Dash array and phase (`D`).
+  pub dash: Option<(Vec<f32>, f32)>,
+  /// Nonstroking alpha (`ca`).
+  pub ca: Option<f32>,
+  /// Stroking alpha (`CA`).
+  pub ca_stroke: Option<f32>,
+  /// Blend mode name (`BM`); rendered as normal.
+  pub blend: Option<String>,
 }
 
 /// Font metadata handed to the interpreter (details grow in M5).
@@ -165,10 +208,11 @@ impl FontInfo {
 pub enum PageItem {
   Text(PdfTextRun),
   Path(PathItem),
+  Gradient(GradientItem),
   /// Named XObject (`Do`); resolved to form/image content in M6.
   XObject(String),
-  /// Pattern shading (`sh`); rendered in a later milestone.
-  Shading(String),
+  /// Pattern reference (tiling renders in a later milestone).
+  Pattern(String),
   /// Graphics state push (`q`); bounds clip lifetime for the view.
   Save,
   /// Graphics state pop (`Q`).
@@ -176,10 +220,27 @@ pub enum PageItem {
 }
 
 /// Resources a content stream can name. Implemented by the document
-/// layer on top of `FileParser`; M4/M6 add more lookups.
+/// layer on top of `FileParser`.
 pub trait ResourceProvider {
   /// Font metadata for a resource name, if declared.
   fn font(&self, name: &str) -> Option<FontInfo>;
+  /// ExtGState dict for a resource name, if declared.
+  fn extgstate(&self, _name: &str) -> Option<ExtGState> {
+    None
+  }
+  /// Resolve a special color space (`Separation`, `DeviceN`,
+  /// `Indexed`, `ICCBased`, calibrated) to sRGB.
+  fn special_color(&self, _space: &str, _comps: &[f32]) -> Option<Rgb> {
+    None
+  }
+  /// Resolve a shading resource for the `sh` operator.
+  fn shading(&self, _name: &str) -> Option<ResolvedShading> {
+    None
+  }
+  /// Resolve a pattern resource for `SCN`/`scn`.
+  fn pattern(&self, _name: &str) -> Option<ResolvedPattern> {
+    None
+  }
 }
 
 /// Full graphics state (ISO 32000 8.4).
@@ -199,6 +260,8 @@ struct State {
   leading: f32,
   rise: f32,
   render_mode: u8,
+  fill_alpha: f32,
+  stroke_alpha: f32,
   in_text: bool,
   tlm: Matrix,
 }
@@ -220,6 +283,8 @@ impl State {
       leading: 0.0,
       rise: 0.0,
       render_mode: 0,
+      fill_alpha: 1.0,
+      stroke_alpha: 1.0,
       in_text: false,
       tlm: Matrix::ident(),
     }
@@ -263,6 +328,8 @@ enum Token {
   Str(Vec<u8>),
   Num(f64),
   Array(Vec<Token>),
+  /// Inline property dicts (`BDC`/`DP`); consumed by M7 structure info.
+  #[allow(dead_code)]
   Dict(Vec<(String, Token)>),
   InlineImage { dict: Vec<(String, Token)>, data: Vec<u8> },
   Op(String),
@@ -789,9 +856,33 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "ri" | "i" => {}
       "gs" => {
-        // ExtGState details (alpha, blend modes) arrive in M4.
-        // Unknown names are ignored so content keeps flowing.
-        let _ = ops.first().and_then(token_name);
+        if let Some(name) = ops.first().and_then(token_name) {
+          if let Some(gs) = self.res.extgstate(name) {
+            let st = self.state_mut();
+            if let Some(w) = gs.lw {
+              st.stroke_style.width = w.max(0.0);
+            }
+            if let Some(c) = gs.lc {
+              st.stroke_style.cap = c.min(2);
+            }
+            if let Some(j) = gs.join {
+              st.stroke_style.join = j.min(2);
+            }
+            if let Some(m) = gs.ml {
+              st.stroke_style.miter = m.max(1.0);
+            }
+            if let Some((dash, phase)) = gs.dash {
+              st.stroke_style.dash = dash;
+              st.stroke_style.phase = phase;
+            }
+            if let Some(a) = gs.ca {
+              st.fill_alpha = a.clamp(0.0, 1.0);
+            }
+            if let Some(a) = gs.ca_stroke {
+              st.stroke_alpha = a.clamp(0.0, 1.0);
+            }
+          }
+        }
       }
       // Path construction.
       "m" => {
@@ -915,7 +1006,6 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "SC" | "SCN" => self.set_color(ops, true)?,
       "sc" | "scn" => self.set_color(ops, false)?,
-      // Text state.
       "BT" => {
         let st = self.state_mut();
         st.in_text = true;
@@ -1055,7 +1145,7 @@ impl<R: ResourceProvider> Interp<R> {
           }
         }
       }
-      // XObjects and shading (resolved in M6).
+      // XObjects, patterns and shading.
       "Do" => {
         if let Some(name) = ops.first().and_then(token_name) {
           self.items.push(PageItem::XObject(name.to_owned()));
@@ -1063,7 +1153,7 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "sh" => {
         if let Some(name) = ops.first().and_then(token_name) {
-          self.items.push(PageItem::Shading(name.to_owned()));
+          self.paint_shading(name);
         }
       }
       // Marked content: structure only, no rendering effect in M3.
@@ -1122,6 +1212,8 @@ impl<R: ResourceProvider> Interp<R> {
       _ => None,
     };
     let ctm = st.ctm;
+    let fill_alpha = st.fill_alpha;
+    let stroke_alpha = st.stroke_alpha;
     if op == "n" && self.pending_clip.is_none() {
       self.path.clear();
       return Ok(());
@@ -1131,7 +1223,9 @@ impl<R: ResourceProvider> Interp<R> {
         subpaths: std::mem::take(&mut self.path),
         ctm,
         fill,
+        fill_alpha,
         stroke,
+        stroke_alpha,
         clip: self.pending_clip,
       }));
     }
@@ -1139,7 +1233,42 @@ impl<R: ResourceProvider> Interp<R> {
     Ok(())
   }
 
+  fn paint_shading(&mut self, name: &str) {
+    let ctm = self.state().ctm;
+    let shading = self.res.shading(name);
+    match shading {
+      Some(ResolvedShading::Axial { coords, stops, extend }) => {
+        self.items.push(PageItem::Gradient(GradientItem {
+          ctm,
+          coords: coords.to_vec(),
+          radial: false,
+          stops,
+          extend,
+        }));
+      }
+      Some(ResolvedShading::Radial { coords, stops, extend }) => {
+        self.items.push(PageItem::Gradient(GradientItem {
+          ctm,
+          coords: coords.to_vec(),
+          radial: true,
+          stops,
+          extend,
+        }));
+      }
+      Some(ResolvedShading::Unsupported) | None => {}
+    }
+  }
+
   fn set_color(&mut self, ops: &[Token], stroking: bool) -> Result<()> {
+    // A trailing name in SCN/scn selects a pattern; numeric operands
+    // before it are the base color for uncolored tiling patterns.
+    // Tiling renders later, so only the reference is kept.
+    if let Some(name) = ops.last().and_then(token_name) {
+      if self.res.pattern(name).is_some() {
+        self.items.push(PageItem::Pattern(name.to_owned()));
+        return Ok(());
+      }
+    }
     let st = self.state();
     let (cs, count) = if stroking {
       (st.stroke_cs.clone(), components(&st.stroke_cs))
@@ -1169,13 +1298,15 @@ impl<R: ResourceProvider> Interp<R> {
           n.get(k.saturating_sub(1)).copied().unwrap_or(0.0) as f32,
         )
       }
-      (ColorSpace::Named(_), _) => {
-        // Pattern and spot colors resolve in M4; keep current paint.
-        if stroking {
-          self.state().stroke_rgb
-        } else {
-          self.state().fill_rgb
-        }
+      (ColorSpace::Named(space), _) => {
+        let comps: Vec<f32> = n.iter().map(|v| *v as f32).collect();
+        self.res.special_color(&space, &comps).unwrap_or_else(|| {
+          if stroking {
+            self.state().stroke_rgb
+          } else {
+            self.state().fill_rgb
+          }
+        })
       }
     }
     .clamp();
@@ -1192,6 +1323,10 @@ impl<R: ResourceProvider> Interp<R> {
     if text.is_empty() || !self.state().in_text {
       return Ok(());
     }
+    // Render mode 3 is invisible text (common for OCR layers).
+    if self.state().render_mode == 3 {
+      return Ok(());
+    }
     let st = self.state();
     let (x, y) = st.text_origin();
     let (dx, dy) = st.text_dir();
@@ -1199,6 +1334,7 @@ impl<R: ResourceProvider> Interp<R> {
     let color = st.fill_rgb;
     let (size, h_scale, char_space, word_space) = (st.font_size, st.h_scale, st.char_space, st.word_space);
     let font_name = st.font.clone();
+    let alpha = st.fill_alpha;
     self.items.push(PageItem::Text(PdfTextRun {
       text: text.clone(),
       x,
@@ -1209,6 +1345,7 @@ impl<R: ResourceProvider> Interp<R> {
       color_rgb: [color.r, color.g, color.b],
       dir_x: dx,
       dir_y: dy,
+      alpha,
     }));
     // Advance estimate (exact advances need font metrics, M5):
     // mean half-em per char plus char/word spacing.

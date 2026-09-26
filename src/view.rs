@@ -6,11 +6,11 @@ use tontooui::renderer::images::ImageLoader;
 use tontooui::renderer::text::{FontSystem, SolidBrush, draw_layout};
 use tontooui::theme::ThemeMode;
 use vello::Scene;
-use vello::kurbo::{Affine, BezPath, Cap, Join, Rect, Stroke};
-use vello::peniko::{Brush, Color, Fill};
+use vello::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
+use vello::peniko::{Brush, Color, ColorStop, Extend, Fill, Gradient};
 
 use crate::document::PdfDocument;
-use crate::graphics::{FillRule, PageItem, PathItem, PathSeg};
+use crate::graphics::{FillRule, GradientItem, PageItem, PathItem, PathSeg, Rgb};
 use crate::page::PdfTextRun;
 
 /// Page paper color (real viewers keep paper white in both themes;
@@ -164,12 +164,13 @@ impl PdfView {
     for item in &page.items {
       if let PageItem::Text(run) = item {
         let weight = if run.bold { 700.0 } else { 400.0 };
-        let color = Color::from_rgb8(
-          (run.color_rgb[0].clamp(0.0, 1.0) * 255.0) as u8,
-          (run.color_rgb[1].clamp(0.0, 1.0) * 255.0) as u8,
-          (run.color_rgb[2].clamp(0.0, 1.0) * 255.0) as u8,
+        let layout = fonts.layout_text_weighted(
+          &run.text,
+          run.font_size * self.zoom,
+          rgba(run_rgb(run), run.alpha),
+          weight,
+          None,
         );
-        let layout = fonts.layout_text_weighted(&run.text, run.font_size * self.zoom, color, weight, None);
         let (x, y) = self.run_origin(run, page.origin_x, page.origin_y + page.height);
         self.runs.push(RunLayout { layout, x, y });
       }
@@ -243,12 +244,19 @@ impl PdfView {
             clip_depth += 1;
           }
           if let Some((rgb, rule)) = &path.fill {
-            scene.fill(fill_of(*rule), Affine::IDENTITY, &Brush::Solid(rgb.to_color()), None, &shape);
+            scene.fill(fill_of(*rule), Affine::IDENTITY, &Brush::Solid(rgba(*rgb, path.fill_alpha)), None, &shape);
           }
           if let Some((rgb, style)) = &path.stroke {
-            scene.stroke(&vello_stroke(style, self.zoom), Affine::IDENTITY, &Brush::Solid(rgb.to_color()), None, &shape);
+            scene.stroke(
+              &vello_stroke(style, self.zoom),
+              Affine::IDENTITY,
+              &Brush::Solid(rgba(*rgb, path.stroke_alpha)),
+              None,
+              &shape,
+            );
           }
         }
+        PageItem::Gradient(shading) => self.paint_gradient(scene, shading, ox, oy1),
         PageItem::Save => save_stack.push(clip_depth),
         PageItem::Restore => {
           if let Some(depth) = save_stack.pop() {
@@ -258,8 +266,8 @@ impl PdfView {
             }
           }
         }
-        // XObjects and shadings resolve in M4/M6; skipped for now.
-        PageItem::XObject(_) | PageItem::Shading(_) => {}
+        // XObjects resolve in M6, tiling patterns later; skipped for now.
+        PageItem::XObject(_) | PageItem::Pattern(_) => {}
       }
     }
     while clip_depth > 0 {
@@ -267,8 +275,59 @@ impl PdfView {
       clip_depth -= 1;
     }
   }
+
+  fn paint_gradient(&self, scene: &mut Scene, shading: &GradientItem, ox: f32, oy1: f32) {
+    let stops: Vec<ColorStop> = shading
+      .stops
+      .iter()
+      .map(|(offset, rgb)| ColorStop { offset: offset.clamp(0.0, 1.0), color: rgba(*rgb, 1.0).into() })
+      .collect();
+    if stops.is_empty() {
+      return;
+    }
+    let map = |x: f32, y: f32| {
+      let (ux, uy) = shading.ctm.apply(x, y);
+      let (px, py) = self.map_point(ox, oy1, ux, uy);
+      Point::new(px as f64, py as f64)
+    };
+    // Non-extended shadings ideally paint nothing outside [0, 1];
+    // Pad approximates the common fully-covered case.
+    let gradient = if shading.radial {
+      let r1 = shading.coords.get(5).copied().unwrap_or(0.0) * self.zoom;
+      if r1 <= 0.0 {
+        return;
+      }
+      Gradient::new_radial(map(shading.coords[3], shading.coords[4]), r1).with_extend(Extend::Pad)
+    } else {
+      Gradient::new_linear(map(shading.coords[0], shading.coords[1]), map(shading.coords[2], shading.coords[3]))
+        .with_extend(Extend::Pad)
+    }
+    .with_stops(stops.as_slice());
+    // Paint across the page; the current clip (if any) bounds it.
+    let (page_w, page_h) = self.page_size();
+    scene.fill(
+      Fill::NonZero,
+      Affine::translate((self.x as f64, self.y as f64)),
+      &Brush::Gradient(gradient),
+      None,
+      &Rect::new(0.0, 0.0, page_w as f64, page_h as f64),
+    );
+  }
 }
 
+fn run_rgb(run: &PdfTextRun) -> Rgb {
+  Rgb { r: run.color_rgb[0], g: run.color_rgb[1], b: run.color_rgb[2] }
+}
+
+fn rgba(rgb: Rgb, alpha: f32) -> Color {
+  let a = (alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+  Color::from_rgba8(
+    (rgb.r.clamp(0.0, 1.0) * 255.0) as u8,
+    (rgb.g.clamp(0.0, 1.0) * 255.0) as u8,
+    (rgb.b.clamp(0.0, 1.0) * 255.0) as u8,
+    a,
+  )
+}
 fn fill_of(rule: FillRule) -> Fill {
   match rule {
     FillRule::NonZero => Fill::NonZero,
