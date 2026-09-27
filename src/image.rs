@@ -148,10 +148,10 @@ pub fn decode_smask_alpha(
   Some(alpha)
 }
 
-/// Decode JPEG bytes (DCTDecode) to RGBA with the `image` crate.
+/// Decode JPEG bytes (DCTDecode) to RGBA through CoreImage.
 pub fn decode_jpeg(data: &[u8]) -> Option<DecodedImage> {
-  let img = image::load_from_memory_with_format(data, image::ImageFormat::Jpeg).ok()?;
-  let rgba = img.to_rgba8();
+  let img = coreimage::io::from_bytes_with_format(data, coreimage::io::ImageFormat::Jpeg).ok()?;
+  let rgba = img.into_rgba();
   let (width, height) = (rgba.width(), rgba.height());
   if width == 0 || height == 0 {
     return None;

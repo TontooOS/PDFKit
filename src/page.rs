@@ -21,6 +21,8 @@ pub struct PdfTextRun {
   pub font_size: f32,
   /// True when the base font name contains `Bold`.
   pub bold: bool,
+  /// True for italic/oblique faces (descriptor flag or name).
+  pub italic: bool,
   /// Resource font name without slash, e.g. `F1`.
   pub font_name: String,
   /// Fill color from the graphics state as sRGB in `0.0..=1.0`.

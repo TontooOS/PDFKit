@@ -1479,7 +1479,9 @@ impl<R: ResourceProvider> Interp<R> {
     let st = self.state();
     let (x, y) = st.text_origin();
     let (dx, dy) = st.text_dir();
-    let bold = self.res.font(&st.font).is_some_and(|f| f.is_bold());
+    let font = self.res.font(&st.font);
+    let bold = font.as_ref().is_some_and(|f| f.is_bold());
+    let italic = font.as_ref().is_some_and(|f| f.italic);
     let color = st.fill_rgb;
     let (size, h_scale, char_space, word_space) = (st.font_size, st.h_scale, st.char_space, st.word_space);
     let font_name = st.font.clone();
@@ -1490,6 +1492,7 @@ impl<R: ResourceProvider> Interp<R> {
       y,
       font_size: size,
       bold,
+      italic,
       font_name,
       color_rgb: [color.r, color.g, color.b],
       dir_x: dx,

@@ -1,9 +1,8 @@
 use std::any::Any;
 
-use parley::Layout;
 use tontooui::elements::layout::View;
 use tontooui::renderer::images::ImageLoader;
-use tontooui::renderer::text::{FontSystem, SolidBrush, draw_layout};
+use tontooui::renderer::text::{CTLine, CrispOpts, FontSystem, draw_line};
 use tontooui::theme::ThemeMode;
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
@@ -27,7 +26,7 @@ pub const PDF_TEXT_LIGHT: Color = Color::from_rgb8(39, 39, 39);
 
 /// One laid-out text run with its view position.
 struct RunLayout {
-  layout: Layout<SolidBrush>,
+  layout: CTLine,
   x: f32,
   y: f32,
 }
@@ -168,12 +167,13 @@ impl PdfView {
     for item in &page.items {
       if let PageItem::Text(run) = item {
         let weight = if run.bold { 700.0 } else { 400.0 };
-        let layout = fonts.layout_text_weighted(
+        let layout = fonts.framesetter().create_line(
           &run.text,
           run.font_size * self.zoom,
           rgba(run_rgb(run), run.alpha),
           weight,
-          None,
+          run.italic,
+          0.0,
         );
         let (x, y) = self.run_origin(run, page.origin_x, page.origin_y + page.height);
         self.runs.push(RunLayout { layout, x, y });
@@ -241,7 +241,13 @@ impl PdfView {
       match item {
         PageItem::Text(_) => {
           if let Some(run) = self.runs.get(run_idx) {
-            draw_layout(scene, &run.layout, run.x, run.y, scale);
+            draw_line(
+              scene,
+              &run.layout,
+              run.x,
+              run.y,
+              CrispOpts { scale, hint: true, subpixel: true },
+            );
           }
           run_idx += 1;
         }
