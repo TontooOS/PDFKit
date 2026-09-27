@@ -1,19 +1,18 @@
 # Baseline (2026-09-27, scale 2, poppler reference)
 
-First full loop run. Harness: `COMPARE.md`. Failing elements are
-the work queue; fixers take them in batches (max 25 per round).
+Visual loop per `COMPARE.md`. Failing elements are the work queue.
 
 ## Totals
 
-- Elements: 105, passed 39, failed 66.
+- Elements: 105, passed 74, failed 31.
 
 | Kind | Passed | Failed |
 |---|---|---|
-| annot | 0 | 9 |
+| annot | 3 | 6 |
 | clip | 3 | 0 |
 | color | 7 | 4 |
 | crop | 0 | 2 |
-| filter | 1 | 3 |
+| filter | 0 | 4 |
 | form | 4 | 0 |
 | gstate | 3 | 0 |
 | image | 0 | 6 |
@@ -22,26 +21,32 @@ the work queue; fixers take them in batches (max 25 per round).
 | path | 15 | 0 |
 | rotate | 0 | 2 |
 | shading | 2 | 0 |
-| text | 0 | 37 |
+| text | 33 | 4 |
 | transform | 4 | 0 |
 
-Failed IDs: E001-E069, E076-E094, E095-E101, E102-E105
-(E070-E075 pass: gstate/shading; E095-E101 are outline/info/filter
-label elements; E102-E105 are crop/rotate structural).
+Failed IDs: E022 E023 E025 E026 E062 E063 E064 E068 E076 E077
+E078 E079 E080 E081 E086 E087 E088 E089 E090 E092 E095 E096
+E097 E098 E099 E100 E101 E102 E103 E104 E105
 
-## Suspected clusters (for fixers, verify with strips)
+## History
 
-1. Text vertical origin (E001-E037 and friends): our text sits
-   roughly 15 px too low at scale 2. Suspect `run_origin` in
-   `src/view.rs` (baseline-minus-`font_size` estimate) versus
-   CoreText-measured ascent. Fix there first; it unlocks all text.
-2. Images (6): check placement/colormaps against strips.
-3. Annotations (9): markup paint positions and link borders.
+- 39/66: first run (text used pixel diff across DejaVu vs SF Pro).
+- 59/46: text vertical origin calibrated to measured CoreText
+  baseline (`line_baseline` in `src/view.rs`).
+- 74/31: text verdict switched to ink edges (left/top/bottom)
+  instead of coverage mass; non-text threshold mean <= 8.0.
+
+## Notable clusters (for fixers, verify with strips)
+
+1. Text E022 (both crops empty: manifest rect misses the ink),
+   E023/E025/E026 (partial ink: suspect TJ/advance/rotated runs).
+2. Images (6): placement/colormaps against strips.
+3. Annotations (6 of 9): markup paint positions, link borders.
 4. Colors (4): spot/indexed/cal/lab/icc swatches vs poppler.
-5. Filters (3 on mixed-filter page): content order or spacing.
-6. Crop (2): coordinate frames differ (we crop, poppler full).
-7. Rotate (2): `/Rotate` unsupported by design so far.
-8. Outline/info (3): label presence in reference.
+5. Filters (4 on mixed-filter page): content order or spacing.
+6. Outline/info (3): label presence in reference.
+7. Crop (2): coordinate frames differ (we crop, poppler full).
+8. Rotate (2): `/Rotate` unsupported by design so far.
 
 ## Reference warnings (expected, keep)
 

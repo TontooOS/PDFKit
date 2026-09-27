@@ -81,7 +81,7 @@ fn parms_list(dict: &PdfValue, count: usize) -> Result<Vec<PdfValue>> {
 
 fn inflate(raw: &[u8]) -> Result<Vec<u8>> {
   use std::io::Read;
-  let mut decoder = flate2::read::ZlibDecoder::new(raw);
+  let decoder = flate2::read::ZlibDecoder::new(raw);
   let mut limited = decoder.take(MAX_STREAM_BYTES as u64 + 1);
   let mut out = Vec::new();
   limited.read_to_end(&mut out).map_err(|e| PdfError::StreamDecode(e.to_string()))?;

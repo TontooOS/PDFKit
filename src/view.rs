@@ -144,11 +144,24 @@ impl PdfView {
     (self.x + (ux - ox) * self.zoom, self.y + (oy1 - uy) * self.zoom)
   }
 
-  /// View position of a run: baseline-to-top approximation
-  /// (ascent ~= font size); exact metrics need embedded fonts (M5).
-  fn run_origin(&self, run: &PdfTextRun, ox: f32, oy1: f32) -> (f32, f32) {
+  /// View position of a run: the CoreText pipeline draws in device
+  /// px (`fonts.scale` per logical px), while paths and the paper use
+  /// zoomed points. The layout is therefore built at
+  /// `font_size * zoom / scale` so its device advances land back on
+  /// zoomed points, and the draw origin is pre-divided by `scale`
+  /// (the draw call re-multiplies). The vertical origin is the PDF
+  /// baseline minus the measured first-line baseline of the laid-out
+  /// line, not a `font_size` estimate.
+  fn run_origin(
+    &self,
+    run: &PdfTextRun,
+    ox: f32,
+    oy1: f32,
+    baseline_device: f32,
+    scale: f32,
+  ) -> (f32, f32) {
     let (px, py) = self.map_point(ox, oy1, run.x, run.y);
-    (px, py - run.font_size * self.zoom)
+    (px / scale, (py - baseline_device) / scale)
   }
 
   fn ensure_layouts(&mut self, fonts: &mut FontSystem) {
@@ -164,18 +177,21 @@ impl PdfView {
         return;
       }
     };
+    let scale = fonts.scale.max(0.5);
+    let (ox, oy1) = (page.origin_x, page.origin_y + page.height);
     for item in &page.items {
       if let PageItem::Text(run) = item {
         let weight = if run.bold { 700.0 } else { 400.0 };
         let layout = fonts.framesetter().create_line(
           &run.text,
-          run.font_size * self.zoom,
+          run.font_size * self.zoom / scale,
           rgba(run_rgb(run), run.alpha),
           weight,
           run.italic,
           0.0,
         );
-        let (x, y) = self.run_origin(run, page.origin_x, page.origin_y + page.height);
+        let baseline = line_baseline(&layout);
+        let (x, y) = self.run_origin(run, ox, oy1, baseline, scale);
         self.runs.push(RunLayout { layout, x, y });
       }
     }
@@ -486,6 +502,20 @@ impl PdfView {
 
 fn run_rgb(run: &PdfTextRun) -> Rgb {
   Rgb { r: run.color_rgb[0], g: run.color_rgb[1], b: run.color_rgb[2] }
+}
+
+/// Measured distance (device px) from the top of a laid-out `CTLine`
+/// to its typographic baseline: the first Parley line's baseline
+/// offset. Falls back to 80% of the line height when the layout has
+/// no lines (never expected for non-empty runs).
+fn line_baseline(line: &CTLine) -> f32 {
+  if let Some(first) = line.inner().lines().next() {
+    let baseline = first.metrics().baseline;
+    if baseline.is_finite() && baseline > 0.0 {
+      return baseline;
+    }
+  }
+  line.height() * line.scale() * 0.8
 }
 
 fn rgba(rgb: Rgb, alpha: f32) -> Color {

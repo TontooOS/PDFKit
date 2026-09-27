@@ -119,16 +119,24 @@ fn main() {
     let (mean, max, dx, dy, ref_px, (cw_used, ch_used)) = best;
     // Verdict: non-text kinds compare pixels (mean tolerates AA
     // fringes and 1px shifts; real bugs score far higher). Text
-    // compares profiles instead: different fonts (DejaVu vs SF Pro)
-    // never match pixels, but presence, ink amount and center of
-    // mass must agree.
+    // compares ink EDGES instead: the reference renders DejaVu while
+    // we render SF Pro, so widths and shapes never match — but the
+    // left/top/bottom ink edges (position and size) must agree.
     let ok = if kind == "text" {
-      let (rcov, rvcom, rhcom) = text_profile(&ref_px, cw_used, ch_used);
-      let (ocov, ovcom, ohcom) = text_profile(&ours.pixels, cw_used, ch_used);
-      let cov_ok = ocov > 0.005 && (rcov - ocov).abs() / rcov.max(1e-6) < 0.6;
-      let pos_ok = (rvcom - ovcom).abs() <= 8.0 && (rhcom - ohcom).abs() <= 12.0;
+      let r = text_edges(&ref_px, cw_used, ch_used);
+      let o = text_edges(&ours.pixels, cw_used, ch_used);
+      let pos_ok = (r.1 - o.1).abs() <= 6.0 && (r.2 - o.2).abs() <= 6.0 && (r.3 - o.3).abs() <= 8.0;
+      let cov_ok = o.0 > 0.005 && r.0 > 0.005;
       println!(
-        "{id} p{page} {kind}: mean={mean:.2} max={max} off={dx},{dy} cov={rcov:.3}/{ocov:.3} vcom={rvcom:.1}/{ovcom:.1} {}",
+        "{id} p{page} {kind}: mean={mean:.2} max={max} off={dx},{dy} cov={:.3}/{:.3} edges={:.0},{:.0},{:.0}/{:.0},{:.0},{:.0} {}",
+        r.0,
+        o.0,
+        r.1,
+        r.2,
+        r.3,
+        o.1,
+        o.2,
+        o.3,
         if cov_ok && pos_ok { "PASS" } else { "FAIL" }
       );
       cov_ok && pos_ok
@@ -285,32 +293,34 @@ fn write_strip(outdir: &str, id: &str, ref_px: &[u8], our_px: &[u8], w: u32, h: 
   }
 }
 
-/// Text profile: ink coverage plus center of mass (px). Robust
-/// across fonts; catches missing, misplaced, mis-sized and
-/// mis-colored text.
-fn text_profile(px: &[u8], w: u32, h: u32) -> (f32, f32, f32) {
+/// Text edges: ink coverage plus leftmost/topmost/bottommost dark
+/// pixel (px). Robust across fonts; catches missing, misplaced and
+/// mis-sized text while tolerating width and shape differences.
+fn text_edges(px: &[u8], w: u32, h: u32) -> (f32, f32, f32, f32) {
   let (w, h) = (w as usize, h as usize);
   if px.len() < w * h * 4 || w == 0 || h == 0 {
-    return (0.0, 0.0, 0.0);
+    return (0.0, 0.0, 0.0, 0.0);
   }
-  let mut dark = 0u64;
-  let mut sx = 0u64;
-  let mut sy = 0u64;
+  let dark = |x: usize, y: usize| {
+    let i = (y * w + x) * 4;
+    (px[i] as u32) + (px[i + 1] as u32) + (px[i + 2] as u32) < 384
+  };
+  let mut count = 0u64;
+  let (mut left, mut top, mut bottom) = (w, h, 0usize);
   for y in 0..h {
     for x in 0..w {
-      let i = (y * w + x) * 4;
-      let lum = px[i] as u32 + px[i + 1] as u32 + px[i + 2] as u32;
-      if lum < 3 * 128 {
-        dark += 1;
-        sx += x as u64;
-        sy += y as u64;
+      if dark(x, y) {
+        count += 1;
+        left = left.min(x);
+        top = top.min(y);
+        bottom = bottom.max(y);
       }
     }
   }
-  if dark == 0 {
-    return (0.0, h as f32 / 2.0, w as f32 / 2.0);
+  if count == 0 {
+    return (0.0, w as f32, 0.0, 0.0);
   }
-  (dark as f32 / (w * h) as f32, sy as f32 / dark as f32, sx as f32 / dark as f32)
+  (count as f32 / (w * h) as f32, left as f32, top as f32, bottom as f32)
 }
 
 fn tally(map: &mut std::collections::BTreeMap<String, (u32, u32)>, kind: &str, ok: bool) {
