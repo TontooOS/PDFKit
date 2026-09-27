@@ -357,7 +357,10 @@ struct State {
   fill_alpha: f32,
   stroke_alpha: f32,
   in_text: bool,
+  /// Text line matrix: start of the current line.
   tlm: Matrix,
+  /// Text matrix: current glyph position (advanced by Tj/TJ only).
+  tm: Matrix,
 }
 
 impl State {
@@ -381,10 +384,11 @@ impl State {
       stroke_alpha: 1.0,
       in_text: false,
       tlm: Matrix::ident(),
+      tm: Matrix::ident(),
     }
   }
 
-  /// Text rendering matrix origin: `([fs*h 0 0 fs 0 rise] x Tlm x CTM)(0,0)`.
+  /// Text rendering matrix origin: `([fs*h 0 0 fs 0 rise] x Tm x CTM)(0,0)`.
   fn text_origin(&self) -> (f32, f32) {
     let font_m = Matrix {
       a: self.font_size * self.h_scale,
@@ -394,7 +398,7 @@ impl State {
       e: 0.0,
       f: self.rise,
     };
-    font_m.concat(self.tlm).concat(self.ctm).apply(0.0, 0.0)
+    font_m.concat(self.tm).concat(self.ctm).apply(0.0, 0.0)
   }
 
   /// X-axis direction of the text matrix (for future underline/selection).
@@ -407,7 +411,7 @@ impl State {
       e: 0.0,
       f: self.rise,
     };
-    let m = font_m.concat(self.tlm).concat(self.ctm);
+    let m = font_m.concat(self.tm).concat(self.ctm);
     let (x0, y0) = m.apply(0.0, 0.0);
     let (x1, y1) = m.apply(1.0, 0.0);
     let len = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt().max(1e-6);
@@ -1126,6 +1130,7 @@ impl<R: ResourceProvider> Interp<R> {
         let st = self.state_mut();
         st.in_text = true;
         st.tlm = Matrix::ident();
+        st.tm = Matrix::ident();
       }
       "ET" => self.state_mut().in_text = false,
       "Tf" => {
@@ -1178,8 +1183,11 @@ impl<R: ResourceProvider> Interp<R> {
       "Tm" => {
         let n = numbers(ops);
         if n.len() >= 6 {
-          self.state_mut().tlm =
+          let m =
             Matrix { a: n[0] as f32, b: n[1] as f32, c: n[2] as f32, d: n[3] as f32, e: n[4] as f32, f: n[5] as f32 };
+          let st = self.state_mut();
+          st.tlm = m;
+          st.tm = m;
         }
       }
       "Td" => {
@@ -1187,7 +1195,10 @@ impl<R: ResourceProvider> Interp<R> {
         if n.len() >= 2 {
           let t = Matrix::translate(n[n.len() - 2] as f32, n[n.len() - 1] as f32);
           let tlm = self.state().tlm;
-          self.state_mut().tlm = t.concat(tlm);
+          let moved = t.concat(tlm);
+          let st = self.state_mut();
+          st.tlm = moved;
+          st.tm = moved;
         }
       }
       "TD" => {
@@ -1195,15 +1206,20 @@ impl<R: ResourceProvider> Interp<R> {
         if n.len() >= 2 {
           let (tx, ty) = (n[n.len() - 2] as f32, n[n.len() - 1] as f32);
           let tlm = self.state().tlm;
+          let moved = Matrix::translate(tx, ty).concat(tlm);
           let st = self.state_mut();
-          st.tlm = Matrix::translate(tx, ty).concat(tlm);
+          st.tlm = moved;
+          st.tm = moved;
           st.leading = -ty;
         }
       }
       "T*" => {
         let leading = self.state().leading;
         let tlm = self.state().tlm;
-        self.state_mut().tlm = Matrix::translate(0.0, -leading).concat(tlm);
+        let moved = Matrix::translate(0.0, -leading).concat(tlm);
+        let st = self.state_mut();
+        st.tlm = moved;
+        st.tm = moved;
       }
       "Tj" => {
         if self.state().in_text {
@@ -1221,8 +1237,8 @@ impl<R: ResourceProvider> Interp<R> {
                 Token::Str(bytes) => self.show(&bytes)?,
                 Token::Num(adjust) => {
                   let dx = -(adjust as f32) * self.state().font_size / 1000.0 * self.state().h_scale;
-                  let tlm = self.state().tlm;
-                  self.state_mut().tlm = Matrix::translate(dx, 0.0).concat(tlm);
+                  let tm = self.state().tm;
+                  self.state_mut().tm = Matrix::translate(dx, 0.0).concat(tm);
                 }
                 _ => {}
               }
@@ -1232,11 +1248,14 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "'" => {
         if self.state().in_text {
+          // Equivalent to `T*` plus `Tj`: the new line starts at the
+          // line-matrix x (Tj advances only Tm, so T* resets x).
           let leading = self.state().leading;
           let tlm = self.state().tlm;
+          let moved = Matrix::translate(0.0, -leading).concat(tlm);
           let st = self.state_mut();
-          st.tlm = Matrix::translate(0.0, -leading).concat(tlm);
-          st.tlm = Matrix::translate(-st.tlm.e, 0.0).concat(st.tlm);
+          st.tlm = moved;
+          st.tm = moved;
           if let Some(Token::Str(bytes)) = ops.last() {
             let bytes = bytes.clone();
             self.show(&bytes)?;
@@ -1251,11 +1270,13 @@ impl<R: ResourceProvider> Interp<R> {
           st.char_space = n[1] as f32;
         }
         if self.state().in_text {
+          // Equivalent to `T*` plus `Tj` after setting spacing.
           let leading = self.state().leading;
           let tlm = self.state().tlm;
+          let moved = Matrix::translate(0.0, -leading).concat(tlm);
           let st = self.state_mut();
-          st.tlm = Matrix::translate(0.0, -leading).concat(tlm);
-          st.tlm = Matrix::translate(-st.tlm.e, 0.0).concat(st.tlm);
+          st.tlm = moved;
+          st.tm = moved;
           if let Some(Token::Str(bytes)) = ops.last() {
             let bytes = bytes.clone();
             self.show(&bytes)?;
@@ -1465,15 +1486,25 @@ impl<R: ResourceProvider> Interp<R> {
     if bytes.is_empty() || !self.state().in_text {
       return Ok(());
     }
-    // Render mode 3 is invisible text (common for OCR layers).
-    if self.state().render_mode == 3 {
-      return Ok(());
-    }
     let st = self.state();
     let decoder = self.res.font(&st.font).map(|f| f.decoder).unwrap_or_else(FontDecoder::winansi);
     let codes = decoder.codes(bytes);
     let text: String = codes.iter().map(|c| decoder.text_of(*c)).collect();
     if text.is_empty() {
+      return Ok(());
+    }
+    let st = self.state();
+    let (size, h_scale, char_space, word_space) = (st.font_size, st.h_scale, st.char_space, st.word_space);
+    // Advance from real glyph widths when known (1/1000 em),
+    // plus char/word spacing; falls back to half-em per code.
+    // Invisible text (render mode 3, common for OCR layers) still
+    // advances the text position even though nothing is painted.
+    let widths: f32 = codes.iter().map(|c| decoder.width_of(*c)).sum::<f32>() / 1000.0;
+    let spaces = text.chars().filter(|c| *c == ' ').count() as f32;
+    let advance = (widths * size + codes.len() as f32 * char_space + spaces * word_space) * h_scale;
+    if self.state().render_mode == 3 {
+      let tm = self.state().tm;
+      self.state_mut().tm = Matrix::translate(advance, 0.0).concat(tm);
       return Ok(());
     }
     let st = self.state();
@@ -1483,7 +1514,7 @@ impl<R: ResourceProvider> Interp<R> {
     let bold = font.as_ref().is_some_and(|f| f.is_bold());
     let italic = font.as_ref().is_some_and(|f| f.italic);
     let color = st.fill_rgb;
-    let (size, h_scale, char_space, word_space) = (st.font_size, st.h_scale, st.char_space, st.word_space);
+    let size = st.font_size;
     let font_name = st.font.clone();
     let alpha = st.fill_alpha;
     self.items.push(PageItem::Text(PdfTextRun {
@@ -1499,13 +1530,8 @@ impl<R: ResourceProvider> Interp<R> {
       dir_y: dy,
       alpha,
     }));
-    // Advance from real glyph widths when known (1/1000 em),
-    // plus char/word spacing; falls back to half-em per code.
-    let widths: f32 = codes.iter().map(|c| decoder.width_of(*c)).sum::<f32>() / 1000.0;
-    let spaces = text.chars().filter(|c| *c == ' ').count() as f32;
-    let advance = (widths * size + codes.len() as f32 * char_space + spaces * word_space) * h_scale;
-    let tlm = self.state().tlm;
-    self.state_mut().tlm = Matrix::translate(advance, 0.0).concat(tlm);
+    let tm = self.state().tm;
+    self.state_mut().tm = Matrix::translate(advance, 0.0).concat(tm);
     Ok(())
   }
 
@@ -1711,5 +1737,50 @@ mod tests {
       })
       .collect();
     assert_eq!(runs.len(), 2);
+  }
+
+  #[test]
+  fn quote_starts_new_line_at_margin() {
+    // `'` is `T*` plus `Tj`: Tj advances only Tm, so the next `'`
+    // starts at the line-matrix x again (both lines at x=56).
+    let items = interpret(b"BT /F1 12 Tf 56 700 Td 14 TL (first) ' (second) ' ET", provider()).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 2);
+    assert_eq!((runs[0].x, runs[0].y), (56.0, 686.0));
+    assert_eq!((runs[1].x, runs[1].y), (56.0, 672.0));
+  }
+
+  #[test]
+  fn tj_advance_does_not_move_line_start() {
+    // A Tj advance must not shift the next T* line: the second line
+    // starts at the margin even after a long first line.
+    let items =
+      interpret(b"BT /F1 12 Tf 56 700 Td 14 TL (long first line) Tj T* (second) Tj ET", provider()).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].x, 56.0);
+    assert_eq!((runs[1].x, runs[1].y), (56.0, 686.0));
+  }
+
+  #[test]
+  fn double_quote_sets_spacing_then_shows() {
+    // `"` sets word/char space, then behaves like `'`.
+    // Leading is 0 here, so T* holds the line start.
+    let items = interpret(b"BT /F1 12 Tf 56 700 Td 3 2 (quoted) \" ET", provider()).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 1);
+    assert_eq!((runs[0].x, runs[0].y), (56.0, 700.0));
+  }
+
+  #[test]
+  fn invisible_text_advances_position() {
+    // Render mode 3 paints nothing but still advances, so the
+    // visible tail starts after the hidden run.
+    let items =
+      interpret(b"BT /F1 12 Tf 56 700 Td 3 Tr (hide) Tj 0 Tr (show) Tj ET", provider()).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].text, "show");
+    assert!(runs[0].x > 60.0, "tail must advance past hidden text, x={}", runs[0].x);
   }
 }

@@ -271,9 +271,12 @@ impl Function {
   }
 }
 
-/// CalGray approximation: gamma on white-scaled input.
+/// CalGray approximation: gamma to linear light, then sRGB encoding.
+/// A bare `gray^gamma` stays dark (0.35^2.2 is 0.099); real viewers
+/// encode the linear value back to sRGB, landing near the input.
 pub fn calgray_to_rgb(gray: f32, gamma: f32) -> Rgb {
-  let g = gray.clamp(0.0, 1.0).powf(gamma.max(0.01));
+  let lin = gray.clamp(0.0, 1.0).powf(gamma.max(0.01));
+  let g = gamma_encode(lin);
   Rgb { r: g, g, b: g }
 }
 
@@ -424,6 +427,14 @@ mod tests {
     let rgb = lab_to_rgb([50.0, 0.0, 0.0]);
     assert!((rgb.r - rgb.g).abs() < 0.02 && (rgb.g - rgb.b).abs() < 0.02);
     assert!(rgb.r > 0.1 && rgb.r < 0.5, "r={}", rgb.r);
+  }
+
+  #[test]
+  fn calgray_encodes_to_srgb() {
+    // 0.35 with Gamma 2.2 is 0.099 linear, ~0.347 sRGB (poppler: 89/255).
+    let rgb = calgray_to_rgb(0.35, 2.2);
+    assert!((rgb.r - 0.347).abs() < 0.02, "r={}", rgb.r);
+    assert!((rgb.r - rgb.g).abs() < 1e-6 && (rgb.g - rgb.b).abs() < 1e-6);
   }
 
   #[test]

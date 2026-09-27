@@ -444,8 +444,10 @@ impl PdfView {
       Some(data) => data,
       None => return,
     };
-    // Unit square (image space, top row first) through CTM to the page.
-    let flip = Affine::new([1.0, 0.0, 0.0, -1.0, 0.0, 1.0]);
+    // Vello draws the image rect (0,0,w,h) in pixel space, top row
+    // first. Map pixels to the PDF unit square first (u = px/w,
+    // v = 1 - py/h), then through the page CTM to user space.
+    let unit = image_pixel_to_unit(img.width, img.height);
     let ctm = Affine::new([
       placed.ctm.a as f64,
       placed.ctm.b as f64,
@@ -458,7 +460,7 @@ impl PdfView {
     let tx = (self.x - ox * self.zoom) as f64;
     let ty = (self.y + oy1 * self.zoom) as f64;
     let page = Affine::new([zoom, 0.0, 0.0, -zoom, tx, ty]);
-    scene.draw_image(data, page * ctm * flip);
+    scene.draw_image(data, page * ctm * unit);
   }
 
   fn paint_gradient(&self, scene: &mut Scene, shading: &GradientItem, ox: f32, oy1: f32) {
@@ -502,6 +504,14 @@ impl PdfView {
 
 fn run_rgb(run: &PdfTextRun) -> Rgb {
   Rgb { r: run.color_rgb[0], g: run.color_rgb[1], b: run.color_rgb[2] }
+}
+
+/// Map image pixels (top row first) to the PDF unit square:
+/// top-left `(0,0)` to `(0,1)`, bottom-right `(w,h)` to `(1,0)`.
+/// Vello draws the `(0,0,w,h)` pixel rect, while the page CTM maps
+/// the unit square, so this adapter sits between them.
+fn image_pixel_to_unit(w: u32, h: u32) -> Affine {
+  Affine::new([1.0 / w.max(1) as f64, 0.0, 0.0, -1.0 / h.max(1) as f64, 0.0, 1.0])
 }
 
 /// Measured distance (device px) from the top of a laid-out `CTLine`
@@ -619,5 +629,15 @@ mod tests {
     assert_eq!(view.current_page(), 0);
     view.prev_page();
     assert_eq!(view.current_page(), 0);
+  }
+
+  #[test]
+  fn image_pixels_map_to_unit_square() {
+    // Top-left pixel is unit (0,1), bottom-right is (1,0).
+    let t = image_pixel_to_unit(16, 8);
+    let p0 = t * Point::new(0.0, 0.0);
+    let p1 = t * Point::new(16.0, 8.0);
+    assert!((p0.x - 0.0).abs() < 1e-9 && (p0.y - 1.0).abs() < 1e-9);
+    assert!((p1.x - 1.0).abs() < 1e-9 && (p1.y - 0.0).abs() < 1e-9);
   }
 }

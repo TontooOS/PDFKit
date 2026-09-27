@@ -129,8 +129,9 @@ pub fn parse_annotation(dict: &PdfValue, resolve_page: &dyn Fn(&PdfValue) -> Opt
   let color = dict.get("C").and_then(array_color);
   let mut border_width = 1.0;
   if let Some(items) = dict.get("Border").and_then(|v| v.as_array()) {
-    if items.len() >= 4 {
-      border_width = items[3].as_number().unwrap_or(1.0) as f32;
+    // `/Border [h v w]` or `[h v w dash]`; the width is the third entry.
+    if items.len() >= 3 {
+      border_width = items[2].as_number().unwrap_or(1.0) as f32;
     } else {
       border_width = 0.0;
     }
@@ -396,5 +397,25 @@ mod tests {
     assert_eq!(pdfdoc_to_string(b"Hi"), "Hi");
     let info = dict(vec![("Title".into(), PdfValue::Str(b"Report".to_vec()))]);
     assert_eq!(parse_info(&info).title.as_deref(), Some("Report"));
+  }
+
+  #[test]
+  fn three_part_border_takes_width() {
+    // `/Border [h v w]`: the width is the third entry.
+    let annot = dict(vec![
+      ("Subtype".into(), PdfValue::Name("Link".into())),
+      ("Rect".into(), PdfValue::Array(vec![num(0.0), num(0.0), num(10.0), num(10.0)])),
+      (
+        "Border".into(),
+        PdfValue::Array(vec![num(0.0), num(0.0), num(2.0)]),
+      ),
+    ]);
+    let parsed = parse_annotation(&annot, &|_| None).unwrap();
+    assert_eq!(parsed.border_width, 2.0);
+    let hidden = dict(vec![
+      ("Subtype".into(), PdfValue::Name("Link".into())),
+      ("Border".into(), PdfValue::Array(vec![num(0.0), num(0.0), num(0.0)])),
+    ]);
+    assert_eq!(parse_annotation(&hidden, &|_| None).unwrap().border_width, 0.0);
   }
 }

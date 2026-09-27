@@ -72,12 +72,10 @@ fn main() {
     }
     let rgba = gpu.render_page(&mut scene, w, h);
     let out = format!("{outdir}/page{n}.png");
-    coreimage::TiImage::new(w, h, rgba)
-      .and_then(|img| img.save(&out, coreimage::ImageFormat::Png, 100))
-      .unwrap_or_else(|e| {
-        eprintln!("cannot save {out}: {e}");
-        std::process::exit(1);
-      });
+    write_png(&out, w, h, &rgba).unwrap_or_else(|e| {
+      eprintln!("cannot save {out}: {e}");
+      std::process::exit(1);
+    });
     println!("page{n}: {w}x{h} -> {out}");
   }
   println!("rendered {pages} pages at scale {scale}");
@@ -194,6 +192,66 @@ impl Gpu {
     buffer.unmap();
     rgba
   }
+}
+
+/// Lossless RGBA8 PNG writer (filter 0, zlib via flate2).
+/// Local to this example so page renders never depend on the
+/// CoreImage PNG encoder; reading still goes through CoreImage.
+fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
+  if w == 0 || h == 0 {
+    return Err("empty image".into());
+  }
+  if rgba.len() != w as usize * h as usize * 4 {
+    return Err("pixel buffer length mismatch".into());
+  }
+  let stride = w as usize * 4;
+  let mut raw = Vec::with_capacity((stride + 1) * h as usize);
+  for y in 0..h as usize {
+    raw.push(0);
+    raw.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
+  }
+  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+  use std::io::Write as _;
+  enc.write_all(&raw).map_err(|e| e.to_string())?;
+  let compressed = enc.finish().map_err(|e| e.to_string())?;
+  let mut out = Vec::with_capacity(compressed.len() + 128);
+  out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
+  let mut ihdr = Vec::with_capacity(13);
+  ihdr.extend_from_slice(&w.to_be_bytes());
+  ihdr.extend_from_slice(&h.to_be_bytes());
+  ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+  write_chunk(&mut out, b"IHDR", &ihdr);
+  write_chunk(&mut out, b"IDAT", &compressed);
+  write_chunk(&mut out, b"IEND", &[]);
+  std::fs::write(path, &out).map_err(|e| e.to_string())?;
+  Ok(())
+}
+
+fn crc32(tag: &[u8; 4], data: &[u8]) -> u32 {
+  static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+  let table = TABLE.get_or_init(|| {
+    let mut t = [0u32; 256];
+    for (i, slot) in t.iter_mut().enumerate() {
+      let mut c = i as u32;
+      for _ in 0..8 {
+        c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+      }
+      *slot = c;
+    }
+    t
+  });
+  let mut crc = 0xFFFF_FFFFu32;
+  for &b in tag.iter().chain(data.iter()) {
+    crc = table[((crc ^ b as u32) & 0xFF) as usize] ^ (crc >> 8);
+  }
+  crc ^ 0xFFFF_FFFF
+}
+
+fn write_chunk(out: &mut Vec<u8>, tag: &[u8; 4], data: &[u8]) {
+  out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+  out.extend_from_slice(tag);
+  out.extend_from_slice(data);
+  out.extend_from_slice(&crc32(tag, data).to_be_bytes());
 }
 
 /// Minimal blocking executor (std only): drives a future to

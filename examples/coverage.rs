@@ -441,7 +441,9 @@ impl Gen {
     c.extend_from_slice(
       format!("BT /F1 12 Tf 56.0 {y:.1} Td 14 TL ([{id}] first) ' (second via quote) ' ET\n").as_bytes(),
     );
-    self.record(id, 1, line_rect(56.0, y, 12.0, 44), "text");
+    // Both quoted lines paint below the Td origin: the first `'` steps
+    // to y-14, the second to y-28. Cover both runs.
+    self.record(id, 1, [54.0, y - 38.0, 360.0, y + 6.0], "text");
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(
