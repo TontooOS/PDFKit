@@ -12,7 +12,11 @@ metadata, and the view paints markup annotations on top of the page.
 | `Underline`, `StrikeOut` | Edge and mid lines from quads or rect |
 | `Square`, `Circle` | Stroked rect and ellipse, `/Border`/`/BS` width |
 | `Ink` | Stroked `/InkList` polylines |
+| `Text` | Filled note rect in `/C` (poppler draws a detailed icon) |
 | Other | Parsed (`contents`, `rect`, `color`) for the editor |
+
+Annotations without `/C` fall back to black (poppler/Acrobat
+behavior for colorless link borders).
 
 Explicit destinations resolve page references and page numbers to
 zero-based indices; named destinations resolve through `/Names`

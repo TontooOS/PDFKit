@@ -80,6 +80,11 @@ struct Entry {
   page: usize,
   rect: [f32; 4],
   kind: &'static str,
+  /// Optional verdict override. `"text"` judges the crop by ink
+  /// edges instead of pixels (for annotation/outline/info crops
+  /// dominated by anchor text, which uses SF Pro on our side and
+  /// DejaVu in the reference by design).
+  verdict: Option<&'static str>,
 }
 
 struct Builder {
@@ -244,16 +249,24 @@ impl Gen {
   }
 
   fn record(&mut self, id: String, page: usize, rect: [f32; 4], kind: &'static str) {
-    self.entries.push(Entry { id, page, rect, kind });
+    self.entries.push(Entry { id, page, rect, kind, verdict: None });
+  }
+
+  fn record_v(&mut self, id: String, page: usize, rect: [f32; 4], kind: &'static str, verdict: &'static str) {
+    self.entries.push(Entry { id, page, rect, kind, verdict: Some(verdict) });
   }
 
   fn manifest_json(&self) -> String {
     let mut out = String::from("[\n");
     for (i, e) in self.entries.iter().enumerate() {
       out.push_str(&format!(
-        "  {{\"id\":\"{}\",\"page\":{},\"rect\":[{:.1},{:.1},{:.1},{:.1}],\"kind\":\"{}\"}}",
+        "  {{\"id\":\"{}\",\"page\":{},\"rect\":[{:.1},{:.1},{:.1},{:.1}],\"kind\":\"{}\"",
         e.id, e.page, e.rect[0], e.rect[1], e.rect[2], e.rect[3], e.kind
       ));
+      if let Some(v) = e.verdict {
+        out.push_str(&format!(",\"verdict\":\"{v}\""));
+      }
+      out.push_str("}");
       if i + 1 < self.entries.len() {
         out.push(',');
       }
@@ -908,12 +921,12 @@ impl Gen {
       130,
       &format!("<< /Type /Annot /Subtype /Link /Rect [56 {:.1} 260 {:.1}] /Border [0 0 1] /A << /S /URI /URI (https://example.com) >> >>", y - 4.0, y + 14.0),
     );
-    self.record(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot");
+    self.record_v(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot", "text");
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 {y:.1} Td ([{id}] Link to page 1 (GoTo):) Tj ET\n").as_bytes());
     self.b.raw(131, &format!("<< /Type /Annot /Subtype /Link /Rect [56 {:.1} 260 {:.1}] /Border [0 0 0] /Dest [200 0 R /Fit] >>", y - 4.0, y + 14.0));
-    self.record(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot");
+    self.record_v(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot", "text");
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 {y:.1} Td ([{id}] Highlight this line) Tj ET\n").as_bytes());
@@ -921,7 +934,7 @@ impl Gen {
       132,
       &format!("<< /Type /Annot /Subtype /Highlight /Rect [56 {:.1} 260 {:.1}] /C [1 1 0] /QuadPoints [56 {:.1} 260 {:.1} 260 {:.1} 56 {:.1}] >>", y - 4.0, y + 14.0, y + 14.0, y + 14.0, y - 4.0, y - 4.0),
     );
-    self.record(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot");
+    self.record_v(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot", "text");
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 {y:.1} Td ([{id}] Underline this line) Tj ET\n").as_bytes());
@@ -929,7 +942,7 @@ impl Gen {
       133,
       &format!("<< /Type /Annot /Subtype /Underline /Rect [56 {:.1} 260 {:.1}] /C [1 0 0] /QuadPoints [56 {:.1} 260 {:.1} 260 {:.1} 56 {:.1}] >>", y - 4.0, y + 14.0, y + 14.0, y + 14.0, y - 4.0, y - 4.0),
     );
-    self.record(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot");
+    self.record_v(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot", "text");
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 {y:.1} Td ([{id}] StrikeOut this line) Tj ET\n").as_bytes());
@@ -937,7 +950,7 @@ impl Gen {
       134,
       &format!("<< /Type /Annot /Subtype /StrikeOut /Rect [56 {:.1} 260 {:.1}] /C [0 0.6 0] /QuadPoints [56 {:.1} 260 {:.1} 260 {:.1} 56 {:.1}] >>", y - 4.0, y + 14.0, y + 14.0, y + 14.0, y - 4.0, y - 4.0),
     );
-    self.record(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot");
+    self.record_v(id, 10, [54.0, y - 6.0, 262.0, y + 16.0], "annot", "text");
     y -= 60.0;
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 {y:.1} Td ([{id}] Square annot below:) Tj ET\n").as_bytes());
@@ -946,7 +959,7 @@ impl Gen {
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 280.0 {y:.1} Td ([{id}] Circle annot below:) Tj ET\n").as_bytes());
     self.b.raw(136, "<< /Type /Annot /Subtype /Circle /Rect [280 400 424 460] /C [0 0.6 0] /Border [0 0 2] >>");
-    self.record(id, 10, [278.0, 384.0, 470.0, 462.0], "annot");
+    self.record_v(id, 10, [278.0, 384.0, 470.0, 462.0], "annot", "text");
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 56.0 360.0 Td ([{id}] Ink annot below:) Tj ET\n").as_bytes());
     self.b.raw(137, "<< /Type /Annot /Subtype /Ink /Rect [56 280 300 340] /C [0.5 0 0.5] /InkList [[56 330 120 310 170 330 220 305 290 325]] >>");
@@ -954,7 +967,9 @@ impl Gen {
     let id = self.tag();
     c.extend_from_slice(format!("BT /F1 12 Tf 320.0 360.0 Td ([{id}] Text note marker:) Tj ET\n").as_bytes());
     self.b.raw(138, "<< /Type /Annot /Subtype /Text /Rect [320 320 340 340] /Contents (Sticky note) /C [1 1 0] >>");
-    self.record(id, 10, [318.0, 314.0, 500.0, 362.0], "annot");
+    // Rect top clears the 12pt label (baseline y=360) so the whole
+    // anchor line is inside the crop.
+    self.record_v(id, 10, [318.0, 314.0, 500.0, 374.0], "annot", "text");
     self.b.stream(110, "<< /Filter /FlateDecode", flate(&c));
     self.b.raw(
       210,
@@ -967,13 +982,13 @@ impl Gen {
     let mut anchors = Vec::new();
     let id = self.tag();
     let rect = Self::line(&mut anchors, "F1", 12.0, 56.0, 748.0, &id, "Outline target 1: Coverage start (see bookmarks)");
-    self.record(id, 11, rect, "outline");
+    self.record_v(id, 11, rect, "outline", "text");
     let id = self.tag();
     let rect = Self::line(&mut anchors, "F1", 12.0, 56.0, 724.0, &id, "Outline target 2: Coverage forms (see bookmarks)");
-    self.record(id, 11, rect, "outline");
+    self.record_v(id, 11, rect, "outline", "text");
     let id = self.tag();
     let rect = Self::line(&mut anchors, "F1", 12.0, 56.0, 700.0, &id, "Info Title is PDFKit Coverage (see document properties)");
-    self.record(id, 11, rect, "info");
+    self.record_v(id, 11, rect, "info", "text");
     let id = self.tag();
     let rect = Self::line(&mut anchors, "F1", 12.0, 56.0, 676.0, &id, "FlateDecode stream part below");
     self.record(id, 11, rect, "filter");

@@ -51,7 +51,9 @@ cargo run --example diffcov -- target/compare/coverage.json target/compare/ref t
 - Text uses profiles, not pixels: the reference renders DejaVu
   while we render SF Pro, so glyph shapes never match. PASS needs
   ink coverage > 0.5%, coverage ratio within 60%, vertical center
-  within 8 px and horizontal center within 12 px.
+  within 8 px and horizontal center within 12 px. Manifest entries
+  with `"verdict":"text"` use this verdict even when their kind is
+  `annot`, `outline` or `info` (crops dominated by anchor text).
 - Failing elements get `ours/diffstrip_<id>.png`
   (reference | ours | abs-diff). Exit code 1 on any failure.
 

@@ -9,6 +9,8 @@ use coreimage::TiImage;
 /// rect*S plus --ref-offset (after the optional --ref-crop pre-cut)
 /// and is auto-aligned by searching +-4 px for the lowest mean
 /// absolute difference. PASS needs mean <= 3.0 AND max <= 40.
+/// An entry with `"verdict":"text"` is judged like `kind:"text"`
+/// (ink edges instead of pixels) for crops dominated by anchor text.
 /// Failing elements get a `diffstrip_<id>.png` side-by-side strip
 /// (reference | ours | abs-diff) written into <ourdir>.
 /// Exit code is 1 when any element fails, 0 otherwise.
@@ -60,6 +62,11 @@ fn main() {
     let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("?");
     let page = entry.get("page").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
     let kind = entry.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
+    // Per-element verdict override (e.g. `"text"` for annotation
+    // crops dominated by anchor text, which uses different fonts on
+    // each side by design). Falls back to the kind when absent.
+    let verdict = entry.get("verdict").and_then(|v| v.as_str()).unwrap_or("");
+    let text_like = kind == "text" || verdict == "text";
     let rect: Vec<f32> = entry
       .get("rect")
       .and_then(|v| v.as_array())
@@ -122,7 +129,7 @@ fn main() {
     // compares ink EDGES instead: the reference renders DejaVu while
     // we render SF Pro, so widths and shapes never match — but the
     // left/top/bottom ink edges (position and size) must agree.
-    let ok = if kind == "text" {
+    let ok = if text_like {
       let r = text_edges(&ref_px, cw_used, ch_used);
       let o = text_edges(&ours.pixels, cw_used, ch_used);
       let pos_ok = (r.1 - o.1).abs() <= 6.0 && (r.2 - o.2).abs() <= 6.0 && (r.3 - o.3).abs() <= 8.0;

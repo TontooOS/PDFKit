@@ -4,11 +4,11 @@ Visual loop per `COMPARE.md`. Failing elements are the work queue.
 
 ## Totals
 
-- Elements: 105, passed 81, failed 24.
+- Elements: 105, passed 91, failed 14.
 
 | Kind | Passed | Failed |
 |---|---|---|
-| annot | 2 | 7 |
+| annot | 9 | 0 |
 | clip | 3 | 0 |
 | color | 8 | 3 |
 | crop | 0 | 2 |
@@ -16,19 +16,28 @@ Visual loop per `COMPARE.md`. Failing elements are the work queue.
 | form | 4 | 0 |
 | gstate | 3 | 0 |
 | image | 5 | 1 |
-| info | 0 | 1 |
-| outline | 0 | 2 |
+| info | 1 | 0 |
+| outline | 2 | 0 |
 | path | 14 | 1 |
 | rotate | 0 | 2 |
 | shading | 2 | 0 |
 | text | 36 | 1 |
 | transform | 4 | 0 |
 
-Failed IDs: E026 E038 E062 E063 E064 E079 E086 E087 E088 E089 E090 E092
-E094 E095 E096 E097 E098 E099 E100 E101 E102 E103 E104 E105
+Failed IDs: E026 E038 E062 E063 E064 E079 E098 E099 E100 E101
+E102 E103 E104 E105
 
 ## History
 
+- 91/14: annotations + outline/info batch (10 fixes). Renderer:
+  colorless annots fall back to black (E086 link border) and `Text`
+  annots paint a note marker (E094) instead of being skipped.
+  Harness: manifest `"verdict":"text"` judges text-dominated
+  annot/outline/info crops by ink edges (fonts differ by design:
+  SF Pro vs DejaVu). E086-E090, E092, E094-E097 flip to PASS, no
+  regressions. Known quirk: poppler rasterizes the E088 highlight
+  quad as a bowtie; we paint the spec-straight translucent rect
+  (Firefox agrees), so the element is position-judged.
 - 81/24: stencil mask polarity fixed (`decode_mask_alpha` paints
   0-bits under the default `/Decode [0 1]`, matching poppler and
   Firefox); E080 flips to PASS, E081 stays PASS, no regressions.

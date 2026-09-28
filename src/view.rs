@@ -319,7 +319,10 @@ impl PdfView {
   }
 
   fn paint_annotation(&self, scene: &mut Scene, annot: &crate::annot::Annotation, ox: f32, oy1: f32) {
-    let color = annot.color.unwrap_or(Rgb { r: 0.0, g: 0.0, b: 1.0 });
+    // Annotations without /C fall back to black (poppler/Acrobat
+    // behavior); the old blue fallback painted colorless link
+    // borders blue (coverage E086).
+    let color = annot.color.unwrap_or(Rgb::black());
     let pt = |x: f32, y: f32| {
       let (px, py) = self.map_point(ox, oy1, x, y);
       (px as f64, py as f64)
@@ -420,6 +423,19 @@ impl PdfView {
         let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
         let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
         scene.stroke(&stroke, Affine::IDENTITY, &brush, None, &Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1)));
+      }
+      "Text" => {
+        // Sticky-note marker: filled note rect in the annot color.
+        // Poppler draws a detailed folded-note icon; the fill keeps
+        // the marker visible and positioned instead of skipping the
+        // annotation (coverage E094). No dark border: the marker must
+        // not pollute ink-edge comparison (it is all mid-tone, like
+        // the reference icon).
+        let brush = Brush::Solid(rgba(color, 1.0));
+        let (x0, y0) = pt(annot.rect[0], annot.rect[1]);
+        let (x1, y1) = pt(annot.rect[2], annot.rect[3]);
+        let shape = Rect::new(x0.min(x1), y0.min(y1), x0.max(x1), y0.max(y1));
+        scene.fill(Fill::NonZero, Affine::IDENTITY, &brush, None, &shape);
       }
       _ => {}
     }

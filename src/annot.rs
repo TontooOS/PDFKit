@@ -343,6 +343,17 @@ mod tests {
   }
 
   #[test]
+  fn colorless_link_has_no_color() {
+    // Links without /C carry no color; the view falls back to black
+    // (poppler/Acrobat behavior) instead of inventing one.
+    let annot = dict(vec![
+      ("Subtype".into(), PdfValue::Name("Link".into())),
+      ("Rect".into(), PdfValue::Array(vec![num(0.0), num(0.0), num(10.0), num(10.0)])),
+    ]);
+    assert_eq!(parse_annotation(&annot, &|_| None).unwrap().color, None);
+  }
+
+  #[test]
   fn highlight_quads_and_color() {
     let annot = dict(vec![
       ("Subtype".into(), PdfValue::Name("Highlight".into())),
