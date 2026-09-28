@@ -54,6 +54,10 @@ cargo run --example diffcov -- target/compare/coverage.json target/compare/ref t
   within 8 px and horizontal center within 12 px. Manifest entries
   with `"verdict":"text"` use this verdict even when their kind is
   `annot`, `outline` or `info` (crops dominated by anchor text).
+  `"verdict":"absent"` passes iff our crop is blank while the
+  reference shows ink (CropBox-clipped content). `"ours_rect"`
+  overrides the ours-side crop rect when frames differ (our page 12
+  is CropBox-sized, poppler rasters the full MediaBox).
 - Failing elements get `ours/diffstrip_<id>.png`
   (reference | ours | abs-diff). Exit code 1 on any failure.
 
@@ -63,7 +67,8 @@ cargo run --example diffcov -- target/compare/coverage.json target/compare/ref t
   Identity-H CID font, dummy ICC profile (poppler falls back to
   `/Alternate`, same as us).
 - CropBox page: our PNG is cropped to the box, poppler keeps full
-  size; element crops may go out of bounds (FAIL with reason).
-- `/Rotate` page: unsupported by design so far (labeled in-PDF).
+  size; the crop elements carry `ours_rect`/`absent` verdicts.
+- `/Rotate` page: applied by the view mapping into the rotated
+  display frame (manifest rects live in that frame).
 - Text origin: our baseline-to-top estimate is suspect (see
   BASELINE.md); fixers calibrate against CoreText-measured ascent.

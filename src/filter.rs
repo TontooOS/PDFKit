@@ -310,11 +310,11 @@ impl<'a> BitReader<'a> {
   }
 }
 
-/// Decode LZW with PDF code assignment (256 EOD, 257 clear).
+/// Decode LZW with PDF code assignment (256 clear, 257 EOD).
 /// `early_change` selects the width-growth rule (1 is the default).
 pub fn lzw_decode(data: &[u8], early_change: i64) -> Result<Vec<u8>> {
-  const CLEAR: u32 = 257;
-  const EOD: u32 = 256;
+  const CLEAR: u32 = 256;
+  const EOD: u32 = 257;
   // Index equals code: 0-255 literals plus dummies for EOD/CLEAR.
   let mut table: Vec<Vec<u8>> = (0u32..256).map(|b| vec![b as u8]).collect();
   table.push(Vec::new());
@@ -439,10 +439,10 @@ mod tests {
         bits.push((acc >> nbits) as u8);
       }
     };
-    emit(257);
+    emit(256);
     emit(65);
     emit(66);
-    emit(256);
+    emit(257);
     if nbits > 0 {
       bits.push((acc << (8 - nbits)) as u8);
     }
@@ -452,8 +452,8 @@ mod tests {
   #[test]
   fn lzw_known_answer_abab() {
     // Hand-encoded per ISO 32000 7.4.4.2 (EarlyChange 1, width 9):
-    // codes 257, 65, 66, 258, 256 packed MSB-first.
-    let bits = [0x80u8, 0x90, 0x48, 0x50, 0x28, 0x00];
+    // codes 256, 65, 66, 258, 257 packed MSB-first.
+    let bits = [0x80u8, 0x10, 0x48, 0x50, 0x28, 0x08];
     assert_eq!(lzw_decode(&bits, 1).unwrap(), b"ABAB");
   }
 
@@ -501,7 +501,7 @@ mod tests {
         *buf &= (1 << *nbits) - 1;
       }
     };
-    emit(257, width, &mut out, &mut buf, &mut nbits);
+    emit(256, width, &mut out, &mut buf, &mut nbits);
     let mut w = vec![data[0]];
     for &b in &data[1..] {
       let mut wc = w.clone();
@@ -519,7 +519,7 @@ mod tests {
       }
     }
     emit(dict[&w], width, &mut out, &mut buf, &mut nbits);
-    emit(256, width, &mut out, &mut buf, &mut nbits);
+    emit(257, width, &mut out, &mut buf, &mut nbits);
     if nbits > 0 {
       out.push((buf << (8 - nbits)) as u8);
     }

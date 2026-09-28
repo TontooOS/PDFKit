@@ -18,6 +18,7 @@
 //! ```
 
 pub mod annot;
+pub mod cmyk_lut;
 pub mod crypt;
 pub mod document;
 pub mod color;

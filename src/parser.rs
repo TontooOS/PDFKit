@@ -45,6 +45,8 @@ pub struct ParsedPage {
   pub resources: PdfValue,
   /// Raw `/Annots` entries (page-level, not inherited).
   pub annots: Vec<PdfValue>,
+  /// `/Rotate` in degrees clockwise, normalized to 0/90/180/270.
+  pub rotate: i32,
 }
 
 /// Parses the file structure: header, xref table or stream, trailer
@@ -566,6 +568,7 @@ impl FileParser {
     if kind == "Page" {
       let index = out.len();
       let media_box = Self::media_box(display);
+      let rotate = Self::page_rotate(node.value.get("Rotate"));
       let content = self.page_content(&node.value)?;
       let resolved_res = self.resolve(resources).unwrap_or(PdfValue::Null);
       let fonts = self.page_fonts(&resolved_res)?;
@@ -575,7 +578,7 @@ impl FileParser {
         .and_then(|v| self.resolve(v).ok())
         .and_then(|v| v.as_array().map(|a| a.to_vec()))
         .unwrap_or_default();
-      out.push(ParsedPage { objnum: node_num, index, media_box, content, fonts, resources: resolved_res, annots });
+      out.push(ParsedPage { objnum: node_num, index, media_box, content, fonts, resources: resolved_res, annots, rotate });
       return Ok(());
     }
     let kids = node
@@ -591,8 +594,15 @@ impl FileParser {
     Ok(())
   }
 
-  fn media_box(value: &PdfValue) -> [f32; 4] {
-    let mut box_vals = [0.0, 0.0, 612.0, 792.0];
+  /// `/Rotate` in degrees clockwise, normalized to 0/90/180/270
+  /// (other values round to the nearest right angle; absent is 0).
+  fn page_rotate(value: Option<&PdfValue>) -> i32 {
+    let deg = value.and_then(|v| v.as_number()).unwrap_or(0.0).round() as i32;
+    let norm = ((deg % 360) + 360) % 360;
+    (norm + 45) / 90 % 4 * 90
+  }
+
+  fn media_box(value: &PdfValue) -> [f32; 4] {    let mut box_vals = [0.0, 0.0, 612.0, 792.0];
     if let Some(items) = value.as_array() {
       for (i, slot) in box_vals.iter_mut().enumerate() {
         if let Some(n) = items.get(i).and_then(|v| v.as_number()) {

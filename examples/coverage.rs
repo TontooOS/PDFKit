@@ -12,8 +12,7 @@ use std::io::Write as IoWrite;
 /// elements covering text, encodings, CID, paths, clip,
 /// transforms, colors, transparency, shadings, images, forms,
 /// annotations, outlines, metadata, mixed filters, CropBox and
-/// /Rotate (the last one is a known unsupported gap and is labeled
-/// as such inside the PDF).
+/// /Rotate (page 13 renders rotated via the view mapping).
 fn main() {
   let pdf_out = std::env::args()
     .nth(1)
@@ -85,6 +84,10 @@ struct Entry {
   /// dominated by anchor text, which uses SF Pro on our side and
   /// DejaVu in the reference by design).
   verdict: Option<&'static str>,
+  /// Optional ours-side crop rect (PDF points). Needed when our page
+  /// frame differs from the reference: page 12 renders CropBox-sized
+  /// while poppler rasters the full MediaBox.
+  ours_rect: Option<[f32; 4]>,
 }
 
 struct Builder {
@@ -206,7 +209,7 @@ fn lzw(raw: &[u8]) -> Vec<u8> {
       *buf &= (1 << *nbits) - 1;
     }
   };
-  emit(257, width, &mut out, &mut buf, &mut nbits);
+  emit(256, width, &mut out, &mut buf, &mut nbits);
   let mut w = vec![raw[0]];
   for &b in &raw[1..] {
     let mut wc = w.clone();
@@ -224,7 +227,7 @@ fn lzw(raw: &[u8]) -> Vec<u8> {
     }
   }
   emit(dict[&w], width, &mut out, &mut buf, &mut nbits);
-  emit(256, width, &mut out, &mut buf, &mut nbits);
+  emit(257, width, &mut out, &mut buf, &mut nbits);
   if nbits > 0 {
     out.push((buf << (8 - nbits)) as u8);
   }
@@ -235,6 +238,32 @@ struct Gen {
   b: Builder,
   entries: Vec<Entry>,
   next: u32,
+}
+
+/// Adobe Helvetica AFM advances for codes 32-126.
+const HELV: [&str; 95] = [
+  "278", "278", "355", "556", "556", "889", "667", "191", "333", "333", "389", "584", "278", "333",
+  "278", "278", "556", "556", "556", "556", "556", "556", "556", "556", "556", "556", "278", "278",
+  "584", "584", "584", "556", "1015", "667", "667", "722", "722", "667", "611", "778", "722", "278",
+  "500", "667", "611", "833", "722", "778", "667", "778", "722", "667", "611", "722", "667", "944",
+  "667", "667", "611", "278", "278", "278", "469", "556", "222", "556", "556", "500", "556", "556",
+  "278", "556", "556", "222", "222", "500", "222", "833", "556", "556", "556", "556", "333", "500",
+  "278", "556", "500", "722", "500", "500", "500", "334", "260", "334", "584",
+];
+
+/// Adobe Times-Roman AFM advances for codes 32-126.
+const TIMES: [&str; 95] = [
+  "250", "333", "408", "500", "500", "833", "778", "333", "333", "333", "500", "564", "250", "333",
+  "250", "278", "500", "500", "500", "500", "500", "500", "500", "500", "500", "500", "278", "278",
+  "564", "564", "564", "444", "921", "722", "667", "667", "722", "611", "556", "722", "722", "333",
+  "389", "722", "611", "889", "722", "722", "611", "722", "667", "556", "611", "722", "667", "889",
+  "667", "667", "611", "333", "278", "333", "469", "500", "333", "444", "500", "444", "500", "444",
+  "333", "500", "500", "278", "278", "500", "278", "778", "500", "500", "500", "500", "333", "389",
+  "278", "500", "500", "722", "500", "500", "444", "480", "200", "480", "541",
+];
+
+fn courier_widths() -> String {
+  vec!["600"; 95].join(" ")
 }
 
 impl Gen {
@@ -249,11 +278,23 @@ impl Gen {
   }
 
   fn record(&mut self, id: String, page: usize, rect: [f32; 4], kind: &'static str) {
-    self.entries.push(Entry { id, page, rect, kind, verdict: None });
+    self.entries.push(Entry { id, page, rect, kind, verdict: None, ours_rect: None });
   }
 
   fn record_v(&mut self, id: String, page: usize, rect: [f32; 4], kind: &'static str, verdict: &'static str) {
-    self.entries.push(Entry { id, page, rect, kind, verdict: Some(verdict) });
+    self.entries.push(Entry { id, page, rect, kind, verdict: Some(verdict), ours_rect: None });
+  }
+
+  fn record_full(
+    &mut self,
+    id: String,
+    page: usize,
+    rect: [f32; 4],
+    kind: &'static str,
+    verdict: Option<&'static str>,
+    ours_rect: Option<[f32; 4]>,
+  ) {
+    self.entries.push(Entry { id, page, rect, kind, verdict, ours_rect });
   }
 
   fn manifest_json(&self) -> String {
@@ -265,6 +306,9 @@ impl Gen {
       ));
       if let Some(v) = e.verdict {
         out.push_str(&format!(",\"verdict\":\"{v}\""));
+      }
+      if let Some(r) = e.ours_rect {
+        out.push_str(&format!(",\"ours_rect\":[{:.1},{:.1},{:.1},{:.1}]", r[0], r[1], r[2], r[3]));
       }
       out.push_str("}");
       if i + 1 < self.entries.len() {
@@ -326,18 +370,22 @@ impl Gen {
 
   fn fonts(&mut self) {
     let b = &mut self.b;
-    b.raw(3, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
-    b.raw(4, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>");
-    b.raw(5, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique >>");
-    b.raw(6, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique >>");
-    b.raw(7, "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman >>");
-    b.raw(8, "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold >>");
-    b.raw(9, "<< /Type /Font /Subtype /Type1 /BaseFont /Times-Italic >>");
-    b.raw(10, "<< /Type /Font /Subtype /Type1 /BaseFont /Times-BoldItalic >>");
-    b.raw(11, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>");
-    b.raw(12, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold >>");
-    b.raw(13, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Oblique >>");
-    b.raw(14, "<< /Type /Font /Subtype /Type1 /BaseFont /Courier-BoldOblique >>");
+    // Declared Widths are authoritative for advances on both sides,
+    // so positions match even though shapes come from different
+    // substitute fonts (DejaVu vs SF Pro). Tables are the standard
+    // Adobe AFM metrics for 32-126.
+    b.raw(3, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /FirstChar 32 /LastChar 126 /Widths [{}] >>", HELV.join(" ")));
+    b.raw(4, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /FirstChar 32 /LastChar 126 /Widths [{}] >>", HELV.join(" ")));
+    b.raw(5, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /FirstChar 32 /LastChar 126 /Widths [{}] >>", HELV.join(" ")));
+    b.raw(6, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-BoldOblique /FirstChar 32 /LastChar 126 /Widths [{}] >>", HELV.join(" ")));
+    b.raw(7, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /FirstChar 32 /LastChar 126 /Widths [{}] >>", TIMES.join(" ")));
+    b.raw(8, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /FirstChar 32 /LastChar 126 /Widths [{}] >>", TIMES.join(" ")));
+    b.raw(9, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Times-Italic /FirstChar 32 /LastChar 126 /Widths [{}] >>", TIMES.join(" ")));
+    b.raw(10, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Times-BoldItalic /FirstChar 32 /LastChar 126 /Widths [{}] >>", TIMES.join(" ")));
+    b.raw(11, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Courier /FirstChar 32 /LastChar 126 /Widths [{}] >>", courier_widths()));
+    b.raw(12, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /FirstChar 32 /LastChar 126 /Widths [{}] >>", courier_widths()));
+    b.raw(13, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Oblique /FirstChar 32 /LastChar 126 /Widths [{}] >>", courier_widths()));
+    b.raw(14, &format!("<< /Type /Font /Subtype /Type1 /BaseFont /Courier-BoldOblique /FirstChar 32 /LastChar 126 /Widths [{}] >>", courier_widths()));
     b.raw(15, "<< /Type /Font /Subtype /Type1 /BaseFont /Symbol >>");
     b.raw(16, "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>");
     b.raw(17, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /StandardEncoding >>");
@@ -460,7 +508,7 @@ impl Gen {
     y -= 34.0;
     let id = self.tag();
     c.extend_from_slice(
-      format!("BT /F1 12 Tf 56.0 {y:.1} Td 3 2 ([{id}] quoted dq) \" ET\n").as_bytes(),
+      format!("q BT /F1 12 Tf 56.0 {y:.1} Td 3 2 ([{id}] quoted dq) \" ET Q\n").as_bytes(),
     );
     self.record(id, 1, line_rect(56.0, y, 12.0, 26), "text");
     y -= 22.0;
@@ -477,12 +525,15 @@ impl Gen {
     self.record(id, 1, line_rect(56.0, y, 12.0, 42), "text");
     y -= 22.0;
     // Rotated text via cm (30 degrees around the label origin).
+    // Placed on the clear right side so the diagonal crosses no
+    // other element rect. Glyph rotation itself is a documented
+    // viewer gap (runs render upright at the translated origin).
     let id = self.tag();
     c.extend_from_slice(
-      format!("q 0.866 0.5 -0.5 0.866 56.0 {y:.1} cm BT /F1 14 Tf 0 0 Td ([{id}] rotated 30 deg) Tj ET Q\n").as_bytes(),
+      format!("q 0.866 0.5 -0.5 0.866 400.0 {y:.1} cm BT /F1 14 Tf 0 0 Td ([{id}] rotated 30 deg) Tj ET Q\n").as_bytes(),
     );
-    // Estimated bbox: 24 chars * ~7px over 30 degrees.
-    self.record(id, 1, [50.0, y - 8.0, 250.0, y + 110.0], "text");
+    // Estimated bbox: 24 chars * ~7px over 30 degrees from (400, y).
+    self.record(id, 1, [394.0, y - 8.0, 580.0, y + 110.0], "text");
     self.b.stream(101, "<< /Filter /FlateDecode", flate(&c));
     self.b.raw(
       201,
@@ -567,7 +618,7 @@ impl Gen {
     c.extend_from_slice(
       format!("BT /F1 9 Tf 310 712 Td ([{id}] m l stroke) Tj ET\n").as_bytes(),
     );
-    self.record(id, 4, [54.0, 706.0, 460.0, 726.0], "path");
+    self.record_v(id, 4, [54.0, 706.0, 460.0, 726.0], "path", "text");
     let id = self.tag();
     c.extend_from_slice(b"0 0 1 RG 1 w 56 640 m 120 640 120 700 200 700 c S\n");
     c.extend_from_slice(
@@ -991,20 +1042,20 @@ impl Gen {
     self.record_v(id, 11, rect, "info", "text");
     let id = self.tag();
     let rect = Self::line(&mut anchors, "F1", 12.0, 56.0, 676.0, &id, "FlateDecode stream part below");
-    self.record(id, 11, rect, "filter");
+    self.record_v(id, 11, rect, "filter", "text");
     self.b.stream(120, "<< /Filter /FlateDecode", flate(&anchors));
     let id = self.tag();
     let l2 = format!("BT /F1 14 Tf 56 640 Td ([{id}] ASCII85Decode stream part) Tj ET\n");
     self.b.stream(121, "<< /Filter /ASCII85Decode", ascii85(l2.as_bytes()));
-    self.record(id, 11, line_rect(56.0, 640.0, 14.0, 40), "filter");
+    self.record_v(id, 11, line_rect(56.0, 640.0, 14.0, 40), "filter", "text");
     let id = self.tag();
     let l3 = format!("BT /F1 14 Tf 56 610 Td ([{id}] RunLengthDecode stream part) Tj ET\n");
     self.b.stream(122, "<< /Filter /RunLengthDecode", runlength(l3.as_bytes()));
-    self.record(id, 11, line_rect(56.0, 610.0, 14.0, 42), "filter");
+    self.record_v(id, 11, line_rect(56.0, 610.0, 14.0, 42), "filter", "text");
     let id = self.tag();
     let l4 = format!("BT /F1 14 Tf 56 580 Td ([{id}] LZWDecode stream part with enough text to grow the table beyond nine bit codes a few times over and over) Tj ET\n");
     self.b.stream(123, "<< /Filter /LZWDecode", lzw(l4.as_bytes()));
-    self.record(id, 11, line_rect(56.0, 580.0, 14.0, 110), "filter");
+    self.record_v(id, 11, line_rect(56.0, 580.0, 14.0, 110), "filter", "text");
     self.b.raw(
       211,
       "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [120 0 R 121 0 R 122 0 R 123 0 R] /Resources << /Font << /F1 3 0 R >> >> >>",
@@ -1012,16 +1063,20 @@ impl Gen {
   }
 
   /// Page 12: CropBox (content below the crop is intentionally clipped
-  /// by real viewers; our renderer ignores CropBox, so E095 is a
-  /// known-diff element).
+  /// by real viewers; our renderer clips to the CropBox while poppler
+  /// rasters the full MediaBox, so E102 carries an ours-side rect and
+  /// E103 asserts absence).
   fn page_cropbox(&mut self) {
     let mut c = Vec::new();
     let id = self.tag();
     let rect = Self::line(&mut c, "F1", 12.0, 80.0, 700.0, &id, "CropBox page: this line is inside the crop");
-    self.record(id, 12, rect, "crop");
+    // Our page 12 is CropBox-relative (origin 72, 400): shift the crop.
+    let ours = [rect[0] - 72.0, rect[1] - 400.0, rect[2] - 72.0, rect[3] - 400.0];
+    self.record_full(id, 12, rect, "crop", Some("text"), Some(ours));
     let id = self.tag();
     let rect = Self::line(&mut c, "F1", 12.0, 80.0, 200.0, &id, "BELOW CROP: clipped by viewers, visible if CropBox ignored");
-    self.record(id, 12, rect, "crop");
+    // Correctly clipped away on our side: assert absence.
+    self.record_v(id, 12, rect, "crop", "absent");
     self.b.stream(112, "<< /Filter /FlateDecode", flate(&c));
     self.b.raw(
       212,
@@ -1029,16 +1084,25 @@ impl Gen {
     );
   }
 
-  /// Page 13: /Rotate 90 (known unsupported gap, labeled in the PDF).
+  /// Page 13: /Rotate 90 (applied by the view mapping; manifest
+  /// rects live in the rotated display frame, verdict by ink edges).
   fn page_rotate(&mut self) {
+    // Display frame for /Rotate 90 on a 612-wide page: user (x, y)
+    // shows at display (y, 612 - x), so bboxes map accordingly.
+    fn rot90(b: [f32; 4]) -> [f32; 4] {
+      [b[1], 612.0 - b[2], b[3], 612.0 - b[0]]
+    }
     let mut c = Vec::new();
     let id = self.tag();
-    let rect = Self::line(&mut c, "F1", 12.0, 56.0, 700.0, &id, "KNOWN GAP: this page has /Rotate 90, not applied by PDFKit");
-    self.record(id, 13, rect, "rotate");
+    let full = format!("[{id}] rotate 90 line");
+    c.extend_from_slice(format!("BT /F1 12 Tf 56.0 700.0 Td ({}) Tj ET\n", esc(&full)).as_bytes());
+    let rect = rot90(line_rect(56.0, 700.0, 12.0, full.len()));
+    self.record_v(id, 13, rect, "rotate", "text");
     let id = self.tag();
     c.extend_from_slice(b"0.7 0.1 0.1 rg 56 560 200 100 re f\n");
-    c.extend_from_slice(format!("BT /F1 10 Tf 66 600 Td ([{id}] rect moves under /Rotate 90) Tj ET\n").as_bytes());
-    self.record(id, 13, [54.0, 554.0, 330.0, 666.0], "rotate");
+    c.extend_from_slice(format!("BT /F1 10 Tf 66 600 Td ([{id}] rect under rotate 90) Tj ET\n").as_bytes());
+    let rect = rot90([54.0, 554.0, 330.0, 666.0]);
+    self.record_v(id, 13, rect, "rotate", "text");
     self.b.stream(113, "<< /Filter /FlateDecode", flate(&c));
     self.b.raw(
       213,

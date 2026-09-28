@@ -58,6 +58,9 @@ pub struct PdfPage {
   pub items: Vec<PageItem>,
   /// Page annotations (links, markup); filled by the document layer.
   pub annotations: Vec<Annotation>,
+  /// `/Rotate` in degrees clockwise (0/90/180/270); applied by the
+  /// view mapping, content stays in unrotated user space.
+  pub rotate: i32,
 }
 
 impl PdfPage {
@@ -88,7 +91,7 @@ impl PdfPage {
     let provider = MapResources { fonts: fonts.iter().map(|f| (f.resource.clone(), FontInfo::simple(&f.resource, &f.base_font))).collect() };
     let items = interpret(content, provider)?;
     let runs = text_runs(&items);
-    Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items, annotations: Vec::new() })
+    Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items, annotations: Vec::new(), rotate: 0 })
   }
 }
 

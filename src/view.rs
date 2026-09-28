@@ -6,7 +6,7 @@ use tontooui::renderer::text::{CTLine, CrispOpts, FontSystem, draw_line};
 use tontooui::theme::ThemeMode;
 use vello::Scene;
 use vello::kurbo::{Affine, BezPath, Cap, Join, Point, Rect, Stroke};
-use vello::peniko::{Brush, Color, ColorStop, Extend, Fill, Gradient, ImageAlphaType, ImageData, ImageFormat};
+use vello::peniko::{Brush, Color, ColorStop, Extend, Fill, Gradient, ImageAlphaType, ImageBrush, ImageData, ImageFormat, ImageQuality};
 
 use crate::document::PdfDocument;
 use crate::graphics::{FillRule, GradientItem, PageItem, PathItem, PathSeg, PlacedImage, Rgb};
@@ -134,14 +134,36 @@ impl PdfView {
 
   fn page_size(&self) -> (f32, f32) {
     match self.doc.page(self.page_no) {
-      Ok(page) => (page.width * self.zoom, page.height * self.zoom),
+      Ok(page) => {
+        let (w, h) = if is_sideways(page.rotate) { (page.height, page.width) } else { (page.width, page.height) };
+        (w * self.zoom, h * self.zoom)
+      }
       Err(_) => (0.0, 0.0),
     }
   }
 
+  /// User space to view logical px through the page `/Rotate`
+  /// transform (y flipped). Every paint path shares this, so rotated
+  /// pages land in the reference frame.
+  fn page_affine(&self, page: &crate::page::PdfPage) -> Affine {
+    let (w, h) = (page.width as f64, page.height as f64);
+    // Local (origin-relative, y-up) to display (y-up) rotation.
+    let rot = match rotate_rem(page.rotate) {
+      90 => Affine::new([0.0, -1.0, 1.0, 0.0, 0.0, w]),
+      180 => Affine::new([-1.0, 0.0, 0.0, -1.0, w, h]),
+      270 => Affine::new([0.0, 1.0, -1.0, 0.0, h, 0.0]),
+      _ => Affine::IDENTITY,
+    };
+    let zoom = self.zoom as f64;
+    let dh = if is_sideways(page.rotate) { w } else { h };
+    let view = Affine::new([zoom, 0.0, 0.0, -zoom, self.x as f64, (self.y as f64) + dh * zoom]);
+    view * rot * Affine::translate((-(page.origin_x as f64), -(page.origin_y as f64)))
+  }
+
   /// Map a user-space point to view logical px (y flipped).
-  fn map_point(&self, ox: f32, oy1: f32, ux: f32, uy: f32) -> (f32, f32) {
-    (self.x + (ux - ox) * self.zoom, self.y + (oy1 - uy) * self.zoom)
+  fn map_point(&self, page: &crate::page::PdfPage, ux: f32, uy: f32) -> (f32, f32) {
+    let p = self.page_affine(page) * Point::new(ux as f64, uy as f64);
+    (p.x as f32, p.y as f32)
   }
 
   /// View position of a run: the CoreText pipeline draws in device
@@ -155,12 +177,11 @@ impl PdfView {
   fn run_origin(
     &self,
     run: &PdfTextRun,
-    ox: f32,
-    oy1: f32,
+    page: &crate::page::PdfPage,
     baseline_device: f32,
     scale: f32,
   ) -> (f32, f32) {
-    let (px, py) = self.map_point(ox, oy1, run.x, run.y);
+    let (px, py) = self.map_point(page, run.x, run.y);
     (px / scale, (py - baseline_device) / scale)
   }
 
@@ -178,7 +199,6 @@ impl PdfView {
       }
     };
     let scale = fonts.scale.max(0.5);
-    let (ox, oy1) = (page.origin_x, page.origin_y + page.height);
     for item in &page.items {
       if let PageItem::Text(run) = item {
         let weight = if run.bold { 700.0 } else { 400.0 };
@@ -191,7 +211,7 @@ impl PdfView {
           0.0,
         );
         let baseline = line_baseline(&layout);
-        let (x, y) = self.run_origin(run, ox, oy1, baseline, scale);
+        let (x, y) = self.run_origin(run, &page, baseline, scale);
         self.runs.push(RunLayout { layout, x, y });
       }
     }
@@ -199,23 +219,23 @@ impl PdfView {
     self.dirty = false;
   }
 
-  fn path_shape(&self, item: &PathItem, ox: f32, oy1: f32) -> BezPath {
+  fn path_shape(&self, item: &PathItem, page: &crate::page::PdfPage) -> BezPath {
     let mut shape = BezPath::new();
     for sub in &item.subpaths {
       for seg in sub {
         match seg {
           PathSeg::Move(x, y) => {
-            let (px, py) = self.mapped(*x, *y, ox, oy1, &item.ctm);
+            let (px, py) = self.mapped(*x, *y, page, &item.ctm);
             shape.move_to((px as f64, py as f64));
           }
           PathSeg::Line(x, y) => {
-            let (px, py) = self.mapped(*x, *y, ox, oy1, &item.ctm);
+            let (px, py) = self.mapped(*x, *y, page, &item.ctm);
             shape.line_to((px as f64, py as f64));
           }
           PathSeg::Curve(x1, y1, x2, y2, x3, y3) => {
-            let (a, b) = self.mapped(*x1, *y1, ox, oy1, &item.ctm);
-            let (c, d) = self.mapped(*x2, *y2, ox, oy1, &item.ctm);
-            let (e, f) = self.mapped(*x3, *y3, ox, oy1, &item.ctm);
+            let (a, b) = self.mapped(*x1, *y1, page, &item.ctm);
+            let (c, d) = self.mapped(*x2, *y2, page, &item.ctm);
+            let (e, f) = self.mapped(*x3, *y3, page, &item.ctm);
             shape.curve_to((a as f64, b as f64), (c as f64, d as f64), (e as f64, f as f64));
           }
           PathSeg::Close => shape.close_path(),
@@ -225,9 +245,9 @@ impl PdfView {
     shape
   }
 
-  fn mapped(&self, x: f32, y: f32, ox: f32, oy1: f32, ctm: &crate::graphics::Matrix) -> (f32, f32) {
+  fn mapped(&self, x: f32, y: f32, page: &crate::page::PdfPage, ctm: &crate::graphics::Matrix) -> (f32, f32) {
     let (ux, uy) = ctm.apply(x, y);
-    self.map_point(ox, oy1, ux, uy)
+    self.map_point(page, ux, uy)
   }
 
   fn render(&mut self, scene: &mut Scene, fonts: &mut FontSystem) {
@@ -245,7 +265,6 @@ impl PdfView {
       Ok(page) => page.clone(),
       Err(_) => return,
     };
-    let (ox, oy1) = (page.origin_x, page.origin_y + page.height);
     if self.img_page != self.page_no {
       self.images.clear();
       self.img_page = self.page_no;
@@ -255,20 +274,22 @@ impl PdfView {
     let mut save_stack: Vec<usize> = Vec::new();
     for (item_no, item) in page.items.iter().enumerate() {
       match item {
-        PageItem::Text(_) => {
+        PageItem::Text(pdf_run) => {
           if let Some(run) = self.runs.get(run_idx) {
-            draw_line(
-              scene,
-              &run.layout,
-              run.x,
-              run.y,
-              CrispOpts { scale, hint: true, subpixel: true },
-            );
+            let opts = CrispOpts { scale, hint: true, subpixel: true };
+            let (ddx, ddy) = page_text_dir(page.rotate, pdf_run.dir_x, pdf_run.dir_y);
+            match text_rotation_angle(ddx, ddy) {
+              None => draw_line(scene, &run.layout, run.x, run.y, opts),
+              Some(angle) => {
+                let (gx, gy) = self.map_point(&page, pdf_run.x, pdf_run.y);
+                draw_rotated_line(scene, &run.layout, run.x, run.y, opts, angle, gx / scale, gy / scale)
+              }
+            }
           }
           run_idx += 1;
         }
         PageItem::Path(path) => {
-          let shape = self.path_shape(path, ox, oy1);
+          let shape = self.path_shape(path, &page);
           if let Some(rule) = path.clip {
             scene.push_clip_layer(fill_of(rule), Affine::IDENTITY, &shape);
             clip_depth += 1;
@@ -286,9 +307,9 @@ impl PdfView {
             );
           }
         }
-        PageItem::Gradient(shading) => self.paint_gradient(scene, shading, ox, oy1),
+        PageItem::Gradient(shading) => self.paint_gradient(scene, shading, &page),
         PageItem::Image(placed) => {
-          self.paint_image(scene, placed, (self.page_no, item_no), ox, oy1);
+          self.paint_image(scene, placed, (self.page_no, item_no), &page);
         }
         PageItem::Save => save_stack.push(clip_depth),
         PageItem::Restore => {
@@ -309,22 +330,22 @@ impl PdfView {
       scene.pop_layer();
       clip_depth -= 1;
     }
-    self.draw_annotations(scene, &page, ox, oy1);
+    self.draw_annotations(scene, &page);
   }
 
-  fn draw_annotations(&self, scene: &mut Scene, page: &crate::page::PdfPage, ox: f32, oy1: f32) {
+  fn draw_annotations(&self, scene: &mut Scene, page: &crate::page::PdfPage) {
     for annot in &page.annotations {
-      self.paint_annotation(scene, annot, ox, oy1);
+      self.paint_annotation(scene, annot, page);
     }
   }
 
-  fn paint_annotation(&self, scene: &mut Scene, annot: &crate::annot::Annotation, ox: f32, oy1: f32) {
+  fn paint_annotation(&self, scene: &mut Scene, annot: &crate::annot::Annotation, page: &crate::page::PdfPage) {
     // Annotations without /C fall back to black (poppler/Acrobat
     // behavior); the old blue fallback painted colorless link
     // borders blue (coverage E086).
     let color = annot.color.unwrap_or(Rgb::black());
     let pt = |x: f32, y: f32| {
-      let (px, py) = self.map_point(ox, oy1, x, y);
+      let (px, py) = self.map_point(page, x, y);
       (px as f64, py as f64)
     };
     match annot.subtype.as_str() {
@@ -441,7 +462,7 @@ impl PdfView {
     }
   }
 
-  fn paint_image(&mut self, scene: &mut Scene, placed: &PlacedImage, key: (usize, usize), ox: f32, oy1: f32) {
+  fn paint_image(&mut self, scene: &mut Scene, placed: &PlacedImage, key: (usize, usize), page: &crate::page::PdfPage) {
     let img = &placed.image;
     if img.width == 0 || img.height == 0 {
       return;
@@ -460,6 +481,10 @@ impl PdfView {
       Some(data) => data,
       None => return,
     };
+    // PDF default is blocky pixels (`/Interpolate` false); only
+    // smooth when the dict asks for interpolation.
+    let quality = if placed.image.interpolate { ImageQuality::Medium } else { ImageQuality::Low };
+    let brush = ImageBrush::new(data.clone()).with_quality(quality);
     // Vello draws the image rect (0,0,w,h) in pixel space, top row
     // first. Map pixels to the PDF unit square first (u = px/w,
     // v = 1 - py/h), then through the page CTM to user space.
@@ -472,14 +497,10 @@ impl PdfView {
       placed.ctm.e as f64,
       placed.ctm.f as f64,
     ]);
-    let zoom = self.zoom as f64;
-    let tx = (self.x - ox * self.zoom) as f64;
-    let ty = (self.y + oy1 * self.zoom) as f64;
-    let page = Affine::new([zoom, 0.0, 0.0, -zoom, tx, ty]);
-    scene.draw_image(data, page * ctm * unit);
+    scene.draw_image(&brush, self.page_affine(page) * ctm * unit);
   }
 
-  fn paint_gradient(&self, scene: &mut Scene, shading: &GradientItem, ox: f32, oy1: f32) {
+  fn paint_gradient(&self, scene: &mut Scene, shading: &GradientItem, page: &crate::page::PdfPage) {
     let stops: Vec<ColorStop> = shading
       .stops
       .iter()
@@ -490,7 +511,7 @@ impl PdfView {
     }
     let map = |x: f32, y: f32| {
       let (ux, uy) = shading.ctm.apply(x, y);
-      let (px, py) = self.map_point(ox, oy1, ux, uy);
+      let (px, py) = self.map_point(page, ux, uy);
       Point::new(px as f64, py as f64)
     };
     // Non-extended shadings ideally paint nothing outside [0, 1];
@@ -518,8 +539,87 @@ impl PdfView {
   }
 }
 
+/// Normalized page rotation: 0, 90, 180 or 270 degrees clockwise.
+fn rotate_rem(rotate: i32) -> i32 {
+  ((rotate % 360) + 360) % 360
+}
+
+/// True for 90/270 degree pages (width and height swap on display).
+fn is_sideways(rotate: i32) -> bool {
+  matches!(rotate_rem(rotate), 90 | 270)
+}
+
+/// Run direction (user-space, y-up) mapped to display (y-up) through
+/// the page `/Rotate` transform (linear part only: no translation).
+fn page_text_dir(rotate: i32, dir_x: f32, dir_y: f32) -> (f32, f32) {
+  match rotate_rem(rotate) {
+    90 => (dir_y, -dir_x),
+    180 => (-dir_x, -dir_y),
+    270 => (-dir_y, dir_x),
+    _ => (dir_x, dir_y),
+  }
+}
+
 fn run_rgb(run: &PdfTextRun) -> Rgb {
   Rgb { r: run.color_rgb[0], g: run.color_rgb[1], b: run.color_rgb[2] }
+}
+
+/// Rotation angle (device radians) for a run direction, or `None`
+/// for plain horizontal text (keeps the fast `draw_line` path).
+/// User-space `dir` is y-up; device space is y-down.
+fn text_rotation_angle(dir_x: f32, dir_y: f32) -> Option<f64> {
+  let angle = (-dir_y as f64).atan2(dir_x as f64);
+  if angle.abs() < 0.001 {
+    None
+  } else {
+    Some(angle)
+  }
+}
+
+/// Draw one laid-out line rotated by `angle` about the glyph origin
+/// (`gx`, `gy` draw units: baseline start). Same crisp pipeline as
+/// `draw_line` (snapped physical origin, hinted glyphs) plus a rigid
+/// Vello glyph transform, so rotated text (`cm` rotation, page
+/// `/Rotate`) matches the reference. The pivot is the glyph origin,
+/// not the layout origin: the reference rotates typeset glyphs about
+/// the text matrix origin.
+fn draw_rotated_line(
+  scene: &mut Scene,
+  line: &CTLine,
+  x: f32,
+  y: f32,
+  opts: CrispOpts,
+  angle: f64,
+  gx: f32,
+  gy: f32,
+) {
+  use parley::PositionedLayoutItem;
+  let scale = opts.scale;
+  let (ox, oy) = ((x * scale).round(), (y * scale).round());
+  let (px, py) = ((gx * scale).round(), (gy * scale).round());
+  let pivot =
+    Affine::translate((px as f64, py as f64)) * Affine::rotate(angle) * Affine::translate((-(px as f64), -(py as f64)));
+  for parley_line in line.inner().lines() {
+    for item in parley_line.items() {
+      if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
+        let run = glyph_run.run();
+        let brush = Brush::Solid(glyph_run.style().brush.color);
+        let glyphs = glyph_run.positioned_glyphs().map(|glyph| {
+          let (gx, gy) = if opts.subpixel {
+            (ox + glyph.x, oy + glyph.y)
+          } else {
+            ((ox + glyph.x).round(), (oy + glyph.y).round())
+          };
+          vello::Glyph { id: glyph.id, x: gx, y: gy }
+        });
+        let mut draw = scene.draw_glyphs(run.font()).font_size(run.font_size());
+        if opts.hint {
+          draw = draw.hint(true);
+        }
+        draw.brush(&brush).transform(pivot).draw(Fill::NonZero, glyphs);
+      }
+    }
+  }
 }
 
 /// Map image pixels (top row first) to the PDF unit square:
@@ -645,6 +745,30 @@ mod tests {
     assert_eq!(view.current_page(), 0);
     view.prev_page();
     assert_eq!(view.current_page(), 0);
+  }
+
+  #[test]
+  fn rotated_run_angle_and_pivot() {
+    assert!(text_rotation_angle(1.0, 0.0).is_none());
+    let tilt = text_rotation_angle(0.8660254, 0.5).unwrap();
+    assert!((tilt + std::f64::consts::FRAC_PI_6).abs() < 1e-6);
+    // Rigid rotation about the pivot maps +x onto the device direction.
+    let t = Affine::translate((10.0, 20.0)) * Affine::rotate(tilt) * Affine::translate((-10.0, -20.0));
+    let p = t * Point::new(11.0, 20.0);
+    assert!((p.x - (10.0 + 0.8660254)).abs() < 1e-6);
+    assert!((p.y - (20.0 - 0.5)).abs() < 1e-6);
+  }
+
+  #[test]
+  fn page_rotation_helpers() {
+    assert_eq!(rotate_rem(90), 90);
+    assert_eq!(rotate_rem(-90), 270);
+    assert_eq!(rotate_rem(360), 0);
+    assert!(is_sideways(90) && is_sideways(270));
+    assert!(!is_sideways(0) && !is_sideways(180));
+    // Page /Rotate 90 turns a horizontal run into bottom-to-top text.
+    assert_eq!(page_text_dir(90, 1.0, 0.0), (0.0, -1.0));
+    assert_eq!(page_text_dir(0, 0.8660, 0.5), (0.8660, 0.5));
   }
 
   #[test]

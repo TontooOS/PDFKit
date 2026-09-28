@@ -23,7 +23,7 @@ left matrix first (`CTM' = M x CTM` for `cm`).
 | Path | `m`, `l`, `c`, `v`, `y`, `h`, `re` | Segments in user space |
 | Paint | `S`, `s`, `f`, `F`, `f*`, `B`, `B*`, `b`, `b*`, `n` | Fill/stroke/close; path consumed |
 | Clip | `W`, `W*` | Pending clip applied by the next paint operator |
-| Color | `G`, `g`, `RG`, `rg`, `K`, `k` | Device gray, RGB, CMYK (naive conversion) |
+| Color | `G`, `g`, `RG`, `rg`, `K`, `k` | Device gray, RGB, CMYK (calibrated SWOP-like table) |
 | Color | `CS`, `cs`, `SC`, `sc`, `SCN`, `scn` | Named spaces resolve via resources |
 | Text state | `Tf`, `Tc`, `Tw`, `Tz`, `TL`, `Ts`, `Tr` | Font, spacing, scale, leading, rise, mode |
 | Text position | `Tm`, `Td`, `TD`, `T*` | Text line matrix updates |

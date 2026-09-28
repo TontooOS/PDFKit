@@ -86,6 +86,7 @@ impl PdfDocument {
         runs,
         items,
         annotations,
+        rotate: item.rotate,
       });
     }
     if pages.is_empty() {
@@ -602,8 +603,14 @@ impl<'a> DocProvider<'a> {
   }
 
   fn decode_image(&self, dict: &PdfValue, raw: &[u8], fill: Rgb, alpha: f32) -> Option<crate::image::DecodedImage> {
-    // Stencil masks paint with the current fill color.
-    if dict.get("ImageMask").and_then(|v| v.as_number()).is_some_and(|v| v != 0.0) {
+    // Stencil masks paint with the current fill color. `/ImageMask`
+    // is a boolean in real files (numbers only in sloppy writers).
+    let masked = match dict.get("ImageMask") {
+      Some(PdfValue::Bool(b)) => *b,
+      Some(v) => v.as_number().is_some_and(|n| n != 0.0),
+      None => false,
+    };
+    if masked {
       let samples = crate::filter::decode(dict, raw).ok()?;
       let plane = decode_mask_alpha(dict, &samples)?;
       let width = dict.get("Width").and_then(|v| v.as_number()).unwrap_or(0.0) as u32;
@@ -656,8 +663,10 @@ impl<'a> DocProvider<'a> {
   fn smask_alpha(&self, dict: &PdfValue) -> Option<Vec<u8>> {
     let target = dict.get("SMask")?;
     let num = target.as_ref().map(|(n, _)| n)?;
-    let (sdict, raw) = self.parser.decoded_stream(num).ok()?;
-    let samples = crate::filter::decode(&sdict, &raw).ok()?;
+    // decoded_stream already returns decoded bytes; running the
+    // filters again would corrupt the mask (coverage E079 then
+    // renders as if unmasked).
+    let (sdict, samples) = self.parser.decoded_stream(num).ok()?;
     let map_space = sdict.get("ColorSpace").and_then(|v| self.parser.resolve_value(v).ok());
     decode_smask_alpha(&sdict, &samples, &|comps| {
       map_space.as_ref().and_then(|space| self.eval_space(space, comps))
@@ -723,6 +732,8 @@ fn inline_value(value: &InlineVal) -> PdfValue {
       "RGB" => PdfValue::Name("DeviceRGB".into()),
       "CMYK" => PdfValue::Name("DeviceCMYK".into()),
       "I" => PdfValue::Name("Indexed".into()),
+      "true" => PdfValue::Bool(true),
+      "false" => PdfValue::Bool(false),
       _ => PdfValue::Name(inline_filter_value(n)),
     },
     InlineVal::Num(n) => PdfValue::Number(*n),
@@ -1058,6 +1069,36 @@ mod tests {
     let placed = image.expect("inline image item");
     assert_eq!((placed.image.width, placed.image.height), (2, 1));
     assert_eq!(&placed.image.rgba[0..4], &[255, 255, 255, 255]);
+  }
+
+  #[test]
+  fn smask_filtered_applies_once() {
+    // E079 regression: the soft mask stream carries /Filter, and its
+    // bytes must be decoded exactly once. Decoding twice drops the
+    // mask so the image renders as if unmasked.
+    use std::io::Write as _;
+    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(&[0u8, 255]).unwrap();
+    let masked = enc.finish().unwrap();
+    let img = [255u8, 0, 0, 0, 0, 255];
+    let content = b"q 2 0 0 1 10 10 cm /Im1 Do Q";
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /XObject << /Im1 5 0 R >> >> >>".to_vec(),
+      [b"<< /Length ".to_vec(), content.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), content.to_vec(), b"\nendstream".to_vec()].concat(),
+      [format!("<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /SMask 6 0 R /Length {} >>\nstream\n", img.len()).into_bytes(), img.to_vec(), b"\nendstream".to_vec()].concat(),
+      [format!("<< /Type /XObject /Subtype /Image /Width 2 /Height 1 /ColorSpace /DeviceGray /BitsPerComponent 8 /Filter /FlateDecode /Length {} >>\nstream\n", masked.len()).into_bytes(), masked, b"\nendstream".to_vec()].concat(),
+    ];
+    let doc = assemble(objects);
+    let placed = doc.page(0).unwrap().items.iter().find_map(|i| match i {
+      crate::graphics::PageItem::Image(p) => Some(p.clone()),
+      _ => None,
+    }).expect("smask image item");
+    assert_eq!(&placed.image.rgba[0..3], &[255, 0, 0]);
+    assert_eq!(placed.image.rgba[3], 0);
+    assert_eq!(&placed.image.rgba[4..7], &[0, 0, 255]);
+    assert_eq!(placed.image.rgba[7], 255);
   }
 
   fn assemble(objects: Vec<Vec<u8>>) -> PdfDocument {

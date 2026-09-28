@@ -46,10 +46,14 @@ Creates a view over `doc`, showing page 0 at 1x zoom.
 
 `PdfView` implements `tontooui::elements::layout::View`:
 
-- `measure` returns the zoomed page size (`width * zoom`, `height * zoom`).
+- `measure` returns the zoomed page size (`width * zoom`, `height * zoom`,
+  swapped for `/Rotate` 90/270).
 - `place` stores the page rect at the given origin.
 - `draw` fills the paper, replays items (paths with clip stack,
   gradients, images, text) and paints annotations on top.
+- Rotated text (`cm` rotation) draws through a rigid Vello glyph
+  transform about the glyph origin; page `/Rotate` maps every item
+  into the rotated display frame. Page size follows the CropBox.
 
 ## Usage / Example
 

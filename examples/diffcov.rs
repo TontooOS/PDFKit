@@ -11,6 +11,10 @@ use coreimage::TiImage;
 /// absolute difference. PASS needs mean <= 3.0 AND max <= 40.
 /// An entry with `"verdict":"text"` is judged like `kind:"text"`
 /// (ink edges instead of pixels) for crops dominated by anchor text.
+/// `"verdict":"absent"` passes iff our crop is blank while the
+/// reference shows ink (e.g. content clipped away by the CropBox).
+/// `"ours_rect"` overrides the ours-side crop rect when our page
+/// frame differs from the reference (CropBox-sized vs MediaBox).
 /// Failing elements get a `diffstrip_<id>.png` side-by-side strip
 /// (reference | ours | abs-diff) written into <ourdir>.
 /// Exit code is 1 when any element fails, 0 otherwise.
@@ -83,6 +87,14 @@ fn main() {
     if let Some((cx, cy, cw, ch)) = ref_crop {
       reference = crop(&reference, cx as i32, cy as i32, cw, ch);
     }
+    // Ours-side crop rect (PDF points): defaults to `rect`, but some
+    // elements render into a different page frame (page 12 is
+    // CropBox-sized on our side, full MediaBox in the reference).
+    let orect: Vec<f32> = entry
+      .get("ours_rect")
+      .and_then(|v| v.as_array())
+      .map(|a| a.iter().filter_map(|v| v.as_f64().map(|f| f as f32)).collect())
+      .unwrap_or_else(|| rect.clone());
     // Element crop in our PNG: exact rect*S (PDF origin is
     // bottom-left, PNG origin top-left).
     let ox0 = (rect[0] * scale).round() as i32;
@@ -90,7 +102,29 @@ fn main() {
     let ox1 = (rect[2] * scale).round() as i32;
     let oy0 = (rect[1] * scale).round() as i32;
     let (ow, oh) = (ox1 - ox0, oy1 - oy0);
-    let ours = crop_top_left(&our, ox0, page_height_top(&our, oy0, oy1), ow as u32, oh as u32);
+    let qx0 = (orect.first().copied().unwrap_or(rect[0]) * scale).round() as i32;
+    let qy1 = (orect.get(3).copied().unwrap_or(rect[3]) * scale).round() as i32;
+    let qy0 = (orect.get(1).copied().unwrap_or(rect[1]) * scale).round() as i32;
+    let ours = crop_top_left(&our, qx0, page_height_top(&our, qy0, qy1), ow as u32, oh as u32);
+    let base_x = ox0 + ref_offset.0;
+    let base_y_top = page_height_top(&reference, oy0, oy1) + ref_offset.1;
+    // Absence verdict (e.g. content clipped away by the CropBox):
+    // PASS iff our crop is blank while the reference shows ink.
+    if verdict == "absent" {
+      let ref0 = crop_top_left(&reference, base_x, base_y_top, ow as u32, oh as u32);
+      let rcov = text_edges(&ref0.pixels, ref0.w, ref0.h).0;
+      let ocov = text_edges(&ours.pixels, ours.w, ours.h).0;
+      let ok = ocov < 0.005 && rcov > 0.005;
+      println!("{id} p{page} {kind}: absent refcov={rcov:.3} ourcov={ocov:.3} {}", if ok { "PASS" } else { "FAIL" });
+      if ok {
+        passed += 1;
+      } else {
+        failed += 1;
+        failed_ids.push(id.to_string());
+      }
+      tally(&mut kinds, kind, ok);
+      continue;
+    }
     if ours.pixels.is_empty() {
       println!("{id} p{page} {kind}: our crop out of bounds, FAIL");
       failed += 1;
@@ -100,8 +134,6 @@ fn main() {
     }
     // Reference crop: same size, translated by --ref-offset, then
     // +-4 px search for the best alignment.
-    let base_x = ox0 + ref_offset.0;
-    let base_y_top = page_height_top(&reference, oy0, oy1) + ref_offset.1;
     let mut best = (f64::INFINITY, 0u8, 0i32, 0i32, Vec::<u8>::new(), (0u32, 0u32));
     for dy in -4..=4 {
       for dx in -4..=4 {
@@ -368,9 +400,12 @@ fn text_edges(px: &[u8], w: u32, h: u32) -> (f32, f32, f32, f32) {
   if px.len() < w * h * 4 || w == 0 || h == 0 {
     return (0.0, 0.0, 0.0, 0.0);
   }
+  // Ink is at most 50% gray: anti-aliased hairlines straddling a
+  // pixel boundary render as exact (128, 128, 128) and must still
+  // count (coverage E038), while paper white stays far above.
   let dark = |x: usize, y: usize| {
     let i = (y * w + x) * 4;
-    (px[i] as u32) + (px[i + 1] as u32) + (px[i + 2] as u32) < 384
+    (px[i] as u32) + (px[i + 1] as u32) + (px[i + 2] as u32) <= 384
   };
   let mut count = 0u64;
   let (mut left, mut top, mut bottom) = (w, h, 0usize);

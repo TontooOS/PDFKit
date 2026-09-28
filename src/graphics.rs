@@ -77,13 +77,13 @@ impl Rgb {
   }
 }
 
-/// Naive CMYK to sRGB conversion (no undercolor removal).
+/// DeviceCMYK to sRGB conversion for unprofiled content. Real
+/// viewers color-manage CMYK through ICC profiles, so this goes
+/// through the calibrated SWOP-like lookup table
+/// (`cmyk_lut::lookup`) instead of the naive formula.
 pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> Rgb {
-  Rgb {
-    r: 1.0 - (c + k).min(1.0),
-    g: 1.0 - (m + k).min(1.0),
-    b: 1.0 - (y + k).min(1.0),
-  }
+  let v = crate::cmyk_lut::lookup(c, m, y, k);
+  Rgb { r: v[0], g: v[1], b: v[2] }
 }
 
 /// Active color space for one stroking/painting side.
@@ -1672,7 +1672,12 @@ mod tests {
     let items = interpret(b"0 1 1 0 k 0 0 1 1 re f", provider()).unwrap();
     match &items[0] {
       PageItem::Path(p) => {
-        assert_eq!(p.fill, Some((Rgb { r: 1.0, g: 0.0, b: 0.0 }, FillRule::NonZero)));
+        // Calibrated SWOP-like red, not naive pure red.
+        let (rgb, rule) = p.fill.clone().expect("fill");
+        assert_eq!(rule, FillRule::NonZero);
+        assert!((rgb.r - 237.0 / 255.0).abs() < 0.004, "{rgb:?}");
+        assert!((rgb.g - 28.0 / 255.0).abs() < 0.004, "{rgb:?}");
+        assert!((rgb.b - 36.0 / 255.0).abs() < 0.004, "{rgb:?}");
       }
       other => panic!("expected path, found {other:?}"),
     }

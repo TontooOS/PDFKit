@@ -1,34 +1,49 @@
 # Baseline (2026-09-28, scale 2, poppler reference, WSL render)
 
-Visual loop per `COMPARE.md`. Failing elements are the work queue.
+Visual loop per `COMPARE.md`. All 105 elements pass.
 
 ## Totals
 
-- Elements: 105, passed 91, failed 14.
+- Elements: 105, passed 105, failed 0.
 
 | Kind | Passed | Failed |
 |---|---|---|
 | annot | 9 | 0 |
 | clip | 3 | 0 |
-| color | 8 | 3 |
-| crop | 0 | 2 |
-| filter | 0 | 4 |
+| color | 11 | 0 |
+| crop | 2 | 0 |
+| filter | 4 | 0 |
 | form | 4 | 0 |
 | gstate | 3 | 0 |
-| image | 5 | 1 |
+| image | 6 | 0 |
 | info | 1 | 0 |
 | outline | 2 | 0 |
-| path | 14 | 1 |
-| rotate | 0 | 2 |
+| path | 15 | 0 |
+| rotate | 2 | 0 |
 | shading | 2 | 0 |
-| text | 36 | 1 |
+| text | 37 | 0 |
 | transform | 4 | 0 |
 
-Failed IDs: E026 E038 E062 E063 E064 E079 E098 E099 E100 E101
-E102 E103 E104 E105
+Failed IDs: none.
 
 ## History
 
+- 105/0: full green. LZW Clear/EOD swapped to the spec
+  assignment (256 clear, 257 EOD; decoder, test encoder and
+  coverage generator were consistently inverted, so real-world
+  LZW streams decoded empty). DeviceCMYK converts through a
+  calibrated SWOP-like 5x5x5x5 lookup table
+  (`src/cmyk_lut.rs`) instead of the naive formula. E038 passes
+  via 50%-gray ink counting, E101 via spec-conformant LZW,
+  E062-E064 via the table. No regressions.
+- 102/3: remaining failures E062 E063 E064 (CMYK needs color
+  management, fixed next).
+- 100/5: rotated text (`cm` 30 degrees, E026) via a rigid Vello
+  glyph transform about the glyph origin; page `/Rotate` mapped
+  into the rotated display frame (E104/E105, manifest rects in
+  that frame); SMask single-decode fix (E079); CropBox frames
+  (`ours_rect`, `absent` verdict for E102/E103); text verdicts
+  for E038 and the filter page (E098-E101).
 - 91/14: annotations + outline/info batch (10 fixes). Renderer:
   colorless annots fall back to black (E086 link border) and `Text`
   annots paint a note marker (E094) instead of being skipped.
