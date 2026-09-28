@@ -45,6 +45,9 @@ See [PdfDocument.md](PdfDocument.md) for details.
 
 ## Changelog
 
+- 2026-09-28: Visual compare loop fully green (105/105): rotated
+  text and page `/Rotate`, spec-correct LZW codes, calibrated CMYK
+  table, CropBox frames, stencil polarity, annotation verdicts.
 - 2026-09-26: Full standard pass M1-M8: filters, xref streams, graphics,
   transparency, fonts, images, annotations, encryption (V1-V5); new wiki
   pages for every feature.
