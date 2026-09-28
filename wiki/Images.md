@@ -16,7 +16,7 @@ never flattened page bitmaps.
 | DCTDecode | JPEG decoded with the `image` crate |
 | JPX, CCITT, JBIG2 | `Skipped` (documented gap) |
 | `/SMask` | Soft-mask alpha planes applied to RGBA |
-| `/ImageMask` | Stencil painted with the current fill color |
+| `/ImageMask` | Stencil painted with the current fill color; 0-bits paint under the default `/Decode [0 1]` |
 | Constant alpha | `ca` baked into the alpha channel |
 
 Width, height and sample counts are capped (16384 px, buffer checks)

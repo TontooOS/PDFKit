@@ -70,7 +70,10 @@ pub fn decode_samples(
 }
 
 /// Decode a stencil mask (1 bpc) into an alpha plane.
-/// Painted samples follow `/Decode` (default `[0 1]`: 1-bits paint).
+/// A stencil paints where the decoded sample is 0: with the default
+/// `/Decode [0 1]` the 0-bits paint (the mask transfers the image's
+/// black bits, matching poppler and Firefox), while an explicit
+/// `/Decode [1 0]` inverts this so the 1-bits paint.
 pub fn decode_mask_alpha(dict: &PdfValue, samples: &[u8]) -> Option<Vec<u8>> {
   let width = dict.get("Width").and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
   let height = dict.get("Height").and_then(|v| v.as_number()).unwrap_or(0.0) as usize;
@@ -88,7 +91,7 @@ pub fn decode_mask_alpha(dict: &PdfValue, samples: &[u8]) -> Option<Vec<u8>> {
       let byte = samples[row * stride + col / 8];
       let bit = (byte >> (7 - (col % 8))) & 1;
       let v = decode[0] + bit as f32 * (decode[1] - decode[0]);
-      alpha.push(if v >= 0.5 { 255 } else { 0 });
+      alpha.push(if v < 0.5 { 255 } else { 0 });
     }
   }
   Some(alpha)
@@ -323,7 +326,40 @@ mod tests {
       ("Width".into(), PdfValue::Number(8.0)),
       ("Height".into(), PdfValue::Number(1.0)),
     ]);
-    assert_eq!(decode_mask_alpha(&dict, &[0b10100000]).unwrap(), vec![255, 0, 255, 0, 0, 0, 0, 0]);
+    // Default Decode [0 1]: 0-bits paint (black bits transfer).
+    assert_eq!(
+      decode_mask_alpha(&dict, &[0b10100000]).unwrap(),
+      vec![0, 255, 0, 255, 255, 255, 255, 255]
+    );
+  }
+
+  #[test]
+  fn mask_explicit_decode_inverts() {
+    let dict = test_dict(vec![
+      ("Width".into(), PdfValue::Number(8.0)),
+      ("Height".into(), PdfValue::Number(1.0)),
+      (
+        "Decode".into(),
+        PdfValue::Array(vec![PdfValue::Number(1.0), PdfValue::Number(0.0)]),
+      ),
+    ]);
+    // Explicit Decode [1 0]: 1-bits paint.
+    assert_eq!(
+      decode_mask_alpha(&dict, &[0b10100000]).unwrap(),
+      vec![255, 0, 255, 0, 0, 0, 0, 0]
+    );
+  }
+
+  #[test]
+  fn mask_e080_stencil_paints_right_column() {
+    // Coverage element E080: 2x2 stencil rows 0x80 (col0 = 1,
+    // col1 = 0). The reference (poppler/Firefox) paints the right
+    // column, so the alpha plane must be [0, 255, 0, 255].
+    let dict = test_dict(vec![
+      ("Width".into(), PdfValue::Number(2.0)),
+      ("Height".into(), PdfValue::Number(2.0)),
+    ]);
+    assert_eq!(decode_mask_alpha(&dict, &[0x80, 0x80]).unwrap(), vec![0, 255, 0, 255]);
   }
 
   #[test]

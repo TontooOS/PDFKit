@@ -1,34 +1,40 @@
-# Baseline (2026-09-27, scale 2, poppler reference)
+# Baseline (2026-09-28, scale 2, poppler reference, WSL render)
 
 Visual loop per `COMPARE.md`. Failing elements are the work queue.
 
 ## Totals
 
-- Elements: 105, passed 74, failed 31.
+- Elements: 105, passed 81, failed 24.
 
 | Kind | Passed | Failed |
 |---|---|---|
-| annot | 3 | 6 |
+| annot | 2 | 7 |
 | clip | 3 | 0 |
-| color | 7 | 4 |
+| color | 8 | 3 |
 | crop | 0 | 2 |
 | filter | 0 | 4 |
 | form | 4 | 0 |
 | gstate | 3 | 0 |
-| image | 0 | 6 |
+| image | 5 | 1 |
 | info | 0 | 1 |
 | outline | 0 | 2 |
-| path | 15 | 0 |
+| path | 14 | 1 |
 | rotate | 0 | 2 |
 | shading | 2 | 0 |
-| text | 33 | 4 |
+| text | 36 | 1 |
 | transform | 4 | 0 |
 
-Failed IDs: E022 E023 E025 E026 E062 E063 E064 E068 E076 E077
-E078 E079 E080 E081 E086 E087 E088 E089 E090 E092 E095 E096
-E097 E098 E099 E100 E101 E102 E103 E104 E105
+Failed IDs: E026 E038 E062 E063 E064 E079 E086 E087 E088 E089 E090 E092
+E094 E095 E096 E097 E098 E099 E100 E101 E102 E103 E104 E105
 
 ## History
+
+- 81/24: stencil mask polarity fixed (`decode_mask_alpha` paints
+  0-bits under the default `/Decode [0 1]`, matching poppler and
+  Firefox); E080 flips to PASS, E081 stays PASS, no regressions.
+- 80/25: declared font Widths, ImageMask boolean handling and
+  blocky (`/Interpolate`) image quality; E080 still failed on
+  stencil polarity (mean 22.9).
 
 - 39/66: first run (text used pixel diff across DejaVu vs SF Pro).
 - 59/46: text vertical origin calibrated to measured CoreText
