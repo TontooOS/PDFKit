@@ -7,7 +7,7 @@ annotations) into a vector/text page model and renders it as a TontooUI
 
 - Repository: https://github.com/TontooOS/PDFKit
 - License: TCL
-- Version: 26.1.0
+- Version: 27.0.0
 
 ## Feature Index
 
