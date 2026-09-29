@@ -104,6 +104,182 @@ pub enum FillRule {
   EvenOdd,
 }
 
+/// True when `subpaths` is a single simple (non-self-intersecting)
+/// polygon without curves. EvenOdd and NonZero fill such shapes
+/// identically, so callers may use the cheaper/safer rule.
+fn is_simple_polygon(subpaths: &[Vec<PathSeg>]) -> bool {
+  if subpaths.len() != 1 {
+    return false;
+  }
+  let sub = &subpaths[0];
+  if sub.len() > 512 {
+    return false;
+  }
+  let mut pts: Vec<(f64, f64)> = Vec::new();
+  for seg in sub {
+    match seg {
+      PathSeg::Move(x, y) => {
+        if !pts.is_empty() {
+          return false;
+        }
+        pts.push((*x as f64, *y as f64));
+      }
+      PathSeg::Line(x, y) => pts.push((*x as f64, *y as f64)),
+      PathSeg::Close => {}
+      PathSeg::Curve(..) => return false,
+    }
+  }
+  // Dedupe consecutive points (zero-length edges break the test).
+  pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
+  // A closed polygon needs at least 3 distinct points; drop a
+  // repeated closing point for the edge walk.
+  if pts.len() >= 2 {
+    let (fx, fy) = pts[0];
+    let (lx, ly) = pts[pts.len() - 1];
+    if (fx - lx).abs() < 1e-9 && (fy - ly).abs() < 1e-9 {
+      pts.pop();
+    }
+  }
+  if pts.len() < 3 {
+    return false;
+  }
+  let n = pts.len();
+  for i in 0..n {
+    let (a, b) = (pts[i], pts[(i + 1) % n]);
+    for j in (i + 1)..n {
+      // Adjacent edges (and first/last) share a vertex by design.
+      if j == i || (j + 1) % n == i || (i + 1) % n == j {
+        continue;
+      }
+      let (c, d) = (pts[j], pts[(j + 1) % n]);
+      if segments_cross(a, b, c, d) {
+        return false;
+      }
+    }
+  }
+  true
+}
+
+/// Proper intersection of open segments ab and cd (touching at
+/// endpoints does not count: shared vertices are legal).
+fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
+  let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
+  let o1 = orient(a, b, c);
+  let o2 = orient(a, b, d);
+  let o3 = orient(c, d, a);
+  let o4 = orient(c, d, b);
+  ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0)) && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))
+}
+
+/// Stroke attributes (PDF `w`, `J`, `j`, `M`, `d`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StrokeStyle {
+  pub width: f32,
+  pub cap: u8,
+  pub join: u8,
+  pub miter: f32,
+  pub dash: Vec<f32>,
+  pub phase: f32,
+}
+
+impl Default for StrokeStyle {
+  fn default() -> Self {
+    Self { width: 1.0, cap: 0, join: 0, miter: 10.0, dash: Vec::new(), phase: 0.0 }
+  }
+}
+
+/// One path segment in user space.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathSeg {
+  Move(f32, f32),
+  Line(f32, f32),
+  Curve(f32, f32, f32, f32, f32, f32),
+  Close,
+}
+
+/// A finished path with its paint and the CTM at paint time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PathItem {
+  /// Subpaths; every subpath starts with `Move` (`re` closes its own).
+  pub subpaths: Vec<Vec<PathSeg>>,
+  /// CTM snapshot when the path was painted.
+  pub ctm: Matrix,
+  /// Fill paint and rule (`S` never sets this).
+  pub fill: Option<(Rgb, FillRule)>,
+  /// Fill alpha from `ca` (`1.0` opaque).
+  pub fill_alpha: f32,
+  /// Stroke paint and style.
+  pub stroke: Option<(Rgb, StrokeStyle)>,
+  /// Stroke alpha from `CA` (`1.0` opaque).
+  pub stroke_alpha: f32,
+  /// Clip rule when `W`/`W*` preceded the paint operator.
+  pub clip: Option<FillRule>,
+}
+
+/// An axial or radial shading resolved for the view.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradientItem {
+  /// CTM snapshot when the shading was painted.
+  pub ctm: Matrix,
+  /// Axial `(x0, y0, x1, y1)` or radial `(x0, y0, r0, x1, y1, r1)` coords.
+  pub coords: Vec<f32>,
+  /// True for radial, false for axial.
+  pub radial: bool,
+  /// Gradient stops (offset `0.0..=1.0`, sRGB).
+  pub stops: Vec<(f32, Rgb)>,
+  /// Extend flags beyond `[0, 1]`.
+  pub extend: [bool; 2],
+}
+
+/// ExtGState parameters applied by the `gs` operator (ISO 32000 8.4.5).
+/// Blend modes, overprint and soft masks parse but render as normal
+/// opaque paint (documented gap); line attributes and constant alpha
+/// apply fully.
+#[derive(Debug, Clone, Default)]
+pub struct ExtGState {
+  /// Line width (`LW`).
+  pub lw: Option<f32>,
+  /// Line cap (`LC`).
+  pub lc: Option<u8>,
+  /// Line join (`LJ`).
+  pub join: Option<u8>,
+  /// Miter limit (`ML`).
+  pub ml: Option<f32>,
+  /// Dash array and phase (`D`).
+  pub dash: Option<(Vec<f32>, f32)>,
+  /// Nonstroking alpha (`ca`).
+  pub ca: Option<f32>,
+  /// Stroking alpha (`CA`).
+  pub ca_stroke: Option<f32>,
+  /// Blend mode name (`BM`); rendered as normal.
+  pub blend: Option<String>,
+}
+
+/// Font metadata handed to the interpreter (encoding and widths
+/// resolve in full; glyph outlines stay with the system fonts).
+#[derive(Debug, Clone)]
+pub struct FontInfo {
+  /// Resource name without slash, e.g. `F1`.
+  pub resource: String,
+  /// `/BaseFont` name, e.g. `Helvetica-Bold`.
+  pub base_font: String,
+  /// True for italic/oblique faces.
+  pub italic: bool,
+  /// Byte-to-text/width decoder for this font.
+  pub decoder: FontDecoder,
+}
+
+impl FontInfo {
+  /// Plain WinAnsi font (used by tests and fallbacks).
+  pub fn simple(resource: &str, base_font: &str) -> Self {
+    Self {
+      resource: resource.into(),
+      base_font: base_font.into(),
+      italic: base_font.to_lowercase().contains("italic") || base_font.to_lowercase().contains("oblique"),
+      decoder: FontDecoder::winansi(),
+    }
+  }
+
   /// True when the base font name marks a bold face.
   pub fn is_bold(&self) -> bool {
     self.base_font.to_lowercase().contains("bold")
@@ -1297,183 +1473,6 @@ impl<R: ResourceProvider> Interp<R> {
     Ok(())
   }
 
-  /// True when `subpaths` is a single simple (non-self-intersecting)
-/// polygon without curves. EvenOdd and NonZero fill such shapes
-/// identically, so callers may use the cheaper/safer rule.
-fn is_simple_polygon(subpaths: &[Vec<PathSeg>]) -> bool {
-  if subpaths.len() != 1 {
-    return false;
-  }
-  let sub = &subpaths[0];
-  if sub.len() > 512 {
-    return false;
-  }
-  let mut pts: Vec<(f64, f64)> = Vec::new();
-  for seg in sub {
-    match seg {
-      PathSeg::Move(x, y) => {
-        if !pts.is_empty() {
-          return false;
-        }
-        pts.push((*x as f64, *y as f64));
-      }
-      PathSeg::Line(x, y) => pts.push((*x as f64, *y as f64)),
-      PathSeg::Close => {}
-      PathSeg::Curve(..) => return false,
-    }
-  }
-  // Dedupe consecutive points (zero-length edges break the test).
-  pts.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
-  // A closed polygon needs at least 3 distinct points; drop a
-  // repeated closing point for the edge walk.
-  if pts.len() >= 2 {
-    let (fx, fy) = pts[0];
-    let (lx, ly) = pts[pts.len() - 1];
-    if (fx - lx).abs() < 1e-9 && (fy - ly).abs() < 1e-9 {
-      pts.pop();
-    }
-  }
-  if pts.len() < 3 {
-    return false;
-  }
-  let n = pts.len();
-  for i in 0..n {
-    let (a, b) = (pts[i], pts[(i + 1) % n]);
-    for j in (i + 1)..n {
-      // Adjacent edges (and first/last) share a vertex by design.
-      if j == i || (j + 1) % n == i || (i + 1) % n == j {
-        continue;
-      }
-      let (c, d) = (pts[j], pts[(j + 1) % n]);
-      if segments_cross(a, b, c, d) {
-        return false;
-      }
-    }
-  }
-  true
-}
-
-/// Proper intersection of open segments ab and cd (touching at
-/// endpoints does not count: shared vertices are legal).
-fn segments_cross(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, f64)) -> bool {
-  let orient = |p: (f64, f64), q: (f64, f64), r: (f64, f64)| (q.0 - p.0) * (r.1 - p.1) - (q.1 - p.1) * (r.0 - p.0);
-  let o1 = orient(a, b, c);
-  let o2 = orient(a, b, d);
-  let o3 = orient(c, d, a);
-  let o4 = orient(c, d, b);
-  ((o1 > 0.0 && o2 < 0.0) || (o1 < 0.0 && o2 > 0.0)) && ((o3 > 0.0 && o4 < 0.0) || (o3 < 0.0 && o4 > 0.0))
-}
-
-
-/// Stroke attributes (PDF `w`, `J`, `j`, `M`, `d`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct StrokeStyle {
-  pub width: f32,
-  pub cap: u8,
-  pub join: u8,
-  pub miter: f32,
-  pub dash: Vec<f32>,
-  pub phase: f32,
-}
-
-impl Default for StrokeStyle {
-  fn default() -> Self {
-    Self { width: 1.0, cap: 0, join: 0, miter: 10.0, dash: Vec::new(), phase: 0.0 }
-  }
-}
-
-/// One path segment in user space.
-#[derive(Debug, Clone, PartialEq)]
-pub enum PathSeg {
-  Move(f32, f32),
-  Line(f32, f32),
-  Curve(f32, f32, f32, f32, f32, f32),
-  Close,
-}
-
-/// A finished path with its paint and the CTM at paint time.
-#[derive(Debug, Clone, PartialEq)]
-pub struct PathItem {
-  /// Subpaths; every subpath starts with `Move` (`re` closes its own).
-  pub subpaths: Vec<Vec<PathSeg>>,
-  /// CTM snapshot when the path was painted.
-  pub ctm: Matrix,
-  /// Fill paint and rule (`S` never sets this).
-  pub fill: Option<(Rgb, FillRule)>,
-  /// Fill alpha from `ca` (`1.0` opaque).
-  pub fill_alpha: f32,
-  /// Stroke paint and style.
-  pub stroke: Option<(Rgb, StrokeStyle)>,
-  /// Stroke alpha from `CA` (`1.0` opaque).
-  pub stroke_alpha: f32,
-  /// Clip rule when `W`/`W*` preceded the paint operator.
-  pub clip: Option<FillRule>,
-}
-
-/// An axial or radial shading resolved for the view.
-#[derive(Debug, Clone, PartialEq)]
-pub struct GradientItem {
-  /// CTM snapshot when the shading was painted.
-  pub ctm: Matrix,
-  /// Axial `(x0, y0, x1, y1)` or radial `(x0, y0, r0, x1, y1, r1)` coords.
-  pub coords: Vec<f32>,
-  /// True for radial, false for axial.
-  pub radial: bool,
-  /// Gradient stops (offset `0.0..=1.0`, sRGB).
-  pub stops: Vec<(f32, Rgb)>,
-  /// Extend flags beyond `[0, 1]`.
-  pub extend: [bool; 2],
-}
-
-/// ExtGState parameters applied by the `gs` operator (ISO 32000 8.4.5).
-/// Blend modes, overprint and soft masks parse but render as normal
-/// opaque paint (documented gap); line attributes and constant alpha
-/// apply fully.
-#[derive(Debug, Clone, Default)]
-pub struct ExtGState {
-  /// Line width (`LW`).
-  pub lw: Option<f32>,
-  /// Line cap (`LC`).
-  pub lc: Option<u8>,
-  /// Line join (`LJ`).
-  pub join: Option<u8>,
-  /// Miter limit (`ML`).
-  pub ml: Option<f32>,
-  /// Dash array and phase (`D`).
-  pub dash: Option<(Vec<f32>, f32)>,
-  /// Nonstroking alpha (`ca`).
-  pub ca: Option<f32>,
-  /// Stroking alpha (`CA`).
-  pub ca_stroke: Option<f32>,
-  /// Blend mode name (`BM`); rendered as normal.
-  pub blend: Option<String>,
-}
-
-/// Font metadata handed to the interpreter (encoding and widths
-/// resolve in full; glyph outlines stay with the system fonts).
-#[derive(Debug, Clone)]
-pub struct FontInfo {
-  /// Resource name without slash, e.g. `F1`.
-  pub resource: String,
-  /// `/BaseFont` name, e.g. `Helvetica-Bold`.
-  pub base_font: String,
-  /// True for italic/oblique faces.
-  pub italic: bool,
-  /// Byte-to-text/width decoder for this font.
-  pub decoder: FontDecoder,
-}
-
-impl FontInfo {
-  /// Plain WinAnsi font (used by tests and fallbacks).
-  pub fn simple(resource: &str, base_font: &str) -> Self {
-    Self {
-      resource: resource.into(),
-      base_font: base_font.into(),
-      italic: base_font.to_lowercase().contains("italic") || base_font.to_lowercase().contains("oblique"),
-      decoder: FontDecoder::winansi(),
-    }
-  }
-
   fn paint_shading(&mut self, name: &str) {
     let ctm = self.state().ctm;
     let shading = self.res.shading(name);
@@ -1737,9 +1736,58 @@ mod tests {
     let items = interpret(b"0 0 10 10 re W* n", provider()).unwrap();
     match &items[0] {
       PageItem::Path(p) => {
-        assert_eq!(p.clip, Some(FillRule::EvenOdd));
+        // Single rectangles are simple polygons: EvenOdd normalizes
+        // to the identical NonZero rule.
+        assert_eq!(p.clip, Some(FillRule::NonZero));
         assert_eq!(p.fill, None);
         assert_eq!(p.stroke, None);
+      }
+      other => panic!("expected path, found {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evenodd_simple_rect_uses_nonzero() {
+    let items = interpret(b"0 0 10 10 re f*", provider()).unwrap();
+    match &items[0] {
+      PageItem::Path(p) => {
+        assert_eq!(p.fill.map(|(_, r)| r), Some(FillRule::NonZero));
+      }
+      other => panic!("expected path, found {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evenodd_crossing_keeps_rule() {
+    // Bowtie: the diagonals cross, so the rules genuinely differ.
+    let items = interpret(b"0 0 m 10 10 l 0 10 l 10 0 l h f*", provider()).unwrap();
+    match &items[0] {
+      PageItem::Path(p) => {
+        assert_eq!(p.fill.map(|(_, r)| r), Some(FillRule::EvenOdd));
+      }
+      other => panic!("expected path, found {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evenodd_hole_keeps_rule() {
+    // Two subpaths (rect + hole): the hole needs EvenOdd.
+    let items = interpret(b"0 0 10 10 re 2 2 6 6 re f*", provider()).unwrap();
+    match &items[0] {
+      PageItem::Path(p) => {
+        assert_eq!(p.subpaths.len(), 2);
+        assert_eq!(p.fill.map(|(_, r)| r), Some(FillRule::EvenOdd));
+      }
+      other => panic!("expected path, found {other:?}"),
+    }
+  }
+
+  #[test]
+  fn evenodd_curve_keeps_rule() {
+    let items = interpret(b"0 0 m 10 0 10 10 0 10 c h f*", provider()).unwrap();
+    match &items[0] {
+      PageItem::Path(p) => {
+        assert_eq!(p.fill.map(|(_, r)| r), Some(FillRule::EvenOdd));
       }
       other => panic!("expected path, found {other:?}"),
     }

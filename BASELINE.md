@@ -36,6 +36,9 @@ Failed IDs: none.
   (`src/cmyk_lut.rs`) instead of the naive formula. E038 passes
   via 50%-gray ink counting, E101 via spec-conformant LZW,
   E062-E064 via the table. No regressions.
+- Post-105: EvenOdd fills of simple polygons normalize to NonZero
+  (identical result; Vello's EvenOdd path dropped whole rows under
+  deep overlap, e.g. ReportLab gradient bands). Loop stays 105/105.
 - 102/3: remaining failures E062 E063 E064 (CMYK needs color
   management, fixed next).
 - 100/5: rotated text (`cm` 30 degrees, E026) via a rigid Vello

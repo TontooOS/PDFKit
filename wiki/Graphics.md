@@ -36,7 +36,8 @@ left matrix first (`CTM' = M x CTM` for `cm`).
 
 Render mode 3 (invisible text, common for OCR layers) emits no run.
 Stroked text modes paint filled (documented gap); text Stroking
-beyond fill is not rendered.
+beyond fill is not rendered. EvenOdd fills of simple polygons render
+as NonZero (identical result, avoids raster seams under overlap).
 
 ## Colors and transparency
 
