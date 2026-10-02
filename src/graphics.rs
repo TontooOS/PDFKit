@@ -4,7 +4,8 @@ use crate::color::{ResolvedPattern, ResolvedShading};
 use crate::error::{PdfError, Result};
 use crate::font::FontDecoder;
 use crate::image::DecodedImage;
-use crate::page::PdfTextRun;
+use crate::page::{OpSpan, PdfTextRun};
+use crate::parser::ContentSegment;
 
 /// 2D affine matrix `[a b c d e f]` in PDF row-vector convention:
 /// `x' = a*x + c*y + e`, `y' = b*x + d*y + f`.
@@ -214,6 +215,9 @@ pub struct PathItem {
   pub stroke_alpha: f32,
   /// Clip rule when `W`/`W*` preceded the paint operator.
   pub clip: Option<FillRule>,
+  /// Byte range of the `cm` that placed this path, so an editor can
+  /// move or rescale it. `None` when no `cm` was active.
+  pub src: Option<OpSpan>,
 }
 
 /// An axial or radial shading resolved for the view.
@@ -315,6 +319,9 @@ pub struct PlacedImage {
   pub image: DecodedImage,
   /// CTM mapping the unit square to user space.
   pub ctm: Matrix,
+  /// Byte range of the `cm` that placed this image, so an editor can
+  /// move, scale or rotate it. `None` when no `cm` was active.
+  pub src: Option<OpSpan>,
 }
 
 /// Result of resolving an XObject or inline image.
@@ -343,7 +350,7 @@ impl InlineVal {
     match token {
       Token::Name(n) => Self::Name(n.clone()),
       Token::Num(n) => Self::Num(*n),
-      Token::Array(items) => Self::Array(items.iter().map(Self::from_token).collect()),
+      Token::Array(items) => Self::Array(items.iter().map(|item| Self::from_token(&item.token)).collect()),
       Token::Str(bytes) => Self::Str(bytes.clone()),
       Token::Dict(_) => Self::Name(String::from("<dict>")),
       Token::InlineImage { .. } => Self::Name(String::from("<image>")),
@@ -408,6 +415,10 @@ pub trait ResourceProvider {
 #[derive(Debug, Clone)]
 struct State {
   ctm: Matrix,
+  /// Byte range of the `cm` that produced `ctm`, carried so paths and
+  /// images painted with this CTM stay addressable for an editor.
+  /// Saved and restored by `q`/`Q` with the rest of the state.
+  cm_span: Option<OpSpan>,
   fill_rgb: Rgb,
   stroke_rgb: Rgb,
   fill_cs: ColorSpace,
@@ -434,6 +445,7 @@ impl State {
   fn new() -> Self {
     Self {
       ctm: Matrix::ident(),
+      cm_span: None,
       fill_rgb: Rgb::black(),
       stroke_rgb: Rgb::black(),
       fill_cs: ColorSpace::Gray,
@@ -486,13 +498,24 @@ impl State {
   }
 }
 
+/// One lexed token plus the byte range it occupies in the content
+/// buffer. The range covers the raw literal including delimiters
+/// (`(...)`, `<...>`, `[...]`) so an editor can replace exactly those
+/// bytes.
+#[derive(Debug, Clone)]
+struct Lexed {
+  token: Token,
+  start: usize,
+  end: usize,
+}
+
 /// Content-stream token: operands plus operators.
 #[derive(Debug, Clone)]
 enum Token {
   Name(String),
   Str(Vec<u8>),
   Num(f64),
-  Array(Vec<Token>),
+  Array(Vec<Lexed>),
   /// Inline property dicts (`BDC`/`DP`); consumed by M7 structure info.
   #[allow(dead_code)]
   Dict(Vec<(String, Token)>),
@@ -503,11 +526,14 @@ enum Token {
 struct Lexer<'a> {
   data: &'a [u8],
   pos: usize,
+  /// First non-whitespace byte of the token currently being lexed;
+  /// read back by `lexed` to stamp `Lexed::start`.
+  span_start: usize,
 }
 
 impl<'a> Lexer<'a> {
   fn new(data: &'a [u8]) -> Self {
-    Self { data, pos: 0 }
+    Self { data, pos: 0, span_start: 0 }
   }
 
   fn skip_ws(&mut self) {
@@ -525,9 +551,14 @@ impl<'a> Lexer<'a> {
     }
   }
 
-  fn next_token(&mut self) -> Result<Option<Token>> {
+  /// Lex one token and the byte range it occupies. `start` is the first
+  /// non-whitespace byte, `end` the position after the token (past the
+  /// closing delimiter for literals, arrays and dicts).
+  fn next_token(&mut self) -> Result<Option<Lexed>> {
     self.skip_ws();
-    let b = match self.data.get(self.pos).copied() {
+    let start = self.pos;
+    self.span_start = start;
+    let b = match self.data.get(start).copied() {
       None => return Ok(None),
       Some(b) => b,
     };
@@ -535,46 +566,62 @@ impl<'a> Lexer<'a> {
       let after = self.pos + 2;
       if self.data.get(after).is_none_or(|c| c.is_ascii_whitespace() || *c == 0) {
         self.pos += 2;
-        return Ok(Some(self.read_inline_image()?));
+        let token = self.read_inline_image()?;
+        return Ok(Some(self.lexed(token)));
       }
     }
     match b {
-      b'(' => Ok(Some(Token::Str(self.read_literal()?))),
+      b'(' => {
+        let token = Token::Str(self.read_literal()?);
+        Ok(Some(self.lexed(token)))
+      }
       b'<' => {
-        if self.data.get(self.pos + 1) == Some(&b'<') {
-          Ok(Some(Token::Dict(self.read_dict()?)))
+        let token = if self.data.get(self.pos + 1) == Some(&b'<') {
+          Token::Dict(self.read_dict()?)
         } else {
-          Ok(Some(Token::Str(self.read_hex()?)))
-        }
+          Token::Str(self.read_hex()?)
+        };
+        Ok(Some(self.lexed(token)))
       }
       b'/' => {
         self.pos += 1;
-        let start = self.pos;
+        let name_start = self.pos;
         while self.pos < self.data.len() && !is_delim(self.data[self.pos]) {
           self.pos += 1;
         }
-        Ok(Some(Token::Name(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned())))
+        let token = Token::Name(String::from_utf8_lossy(&self.data[name_start..self.pos]).into_owned());
+        Ok(Some(self.lexed(token)))
       }
       b'[' => {
         self.pos += 1;
-        Ok(Some(Token::Array(self.read_array()?)))
+        let token = Token::Array(self.read_array()?);
+        Ok(Some(self.lexed(token)))
       }
-      c if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => Ok(Some(Token::Num(self.read_number()?))),
+      c if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => {
+        let token = Token::Num(self.read_number()?);
+        Ok(Some(self.lexed(token)))
+      }
       _ => {
-        let start = self.pos;
+        let op_start = self.pos;
         while self.pos < self.data.len() && !is_delim(self.data[self.pos]) {
           self.pos += 1;
         }
-        if self.pos == start {
+        if self.pos == op_start {
           // Stray delimiter (e.g. `)`, `>`, `]` from damaged content):
           // skip one byte so lexing always advances. Never emit empty
           // operators; they would spin the interpreter forever.
           self.pos += 1;
           return self.next_token();
         }
-        Ok(Some(Token::Op(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned())))
+        let token = Token::Op(String::from_utf8_lossy(&self.data[op_start..self.pos]).into_owned());
+        Ok(Some(self.lexed(token)))
       }
     }
+  }
+
+  /// Pair a freshly produced token with the range `next_token` consumed.
+  fn lexed(&self, token: Token) -> Lexed {
+    Lexed { token, start: self.span_start, end: self.pos }
   }
 
   fn read_literal(&mut self) -> Result<Vec<u8>> {
@@ -680,28 +727,44 @@ impl<'a> Lexer<'a> {
     text.parse::<f64>().map_err(|_| PdfError::ContentParse(format!("bad number: {text}")))
   }
 
-  fn read_array(&mut self) -> Result<Vec<Token>> {
+  /// Array items keep their own byte ranges: a `TJ` array holds the
+  /// per-string literals an editor rewrites.
+  fn read_array(&mut self) -> Result<Vec<Lexed>> {
     let mut items = Vec::new();
     loop {
       self.skip_ws();
+      self.span_start = self.pos;
       match self.data.get(self.pos).copied() {
         None => return Err(PdfError::ContentParse("unterminated array".into())),
         Some(b']') => {
           self.pos += 1;
           return Ok(items);
         }
-        Some(b'(') => items.push(Token::Str(self.read_literal()?)),
-        Some(b'<') if self.data.get(self.pos + 1) != Some(&b'<') => items.push(Token::Str(self.read_hex()?)),
-        Some(b'<') => items.push(Token::Dict(self.read_dict_at()?)),
+        Some(b'(') => {
+          let token = Token::Str(self.read_literal()?);
+          items.push(self.lexed(token));
+        }
+        Some(b'<') if self.data.get(self.pos + 1) != Some(&b'<') => {
+          let token = Token::Str(self.read_hex()?);
+          items.push(self.lexed(token));
+        }
+        Some(b'<') => {
+          let token = Token::Dict(self.read_dict_at()?);
+          items.push(self.lexed(token));
+        }
         Some(b'/') => {
           self.pos += 1;
           let start = self.pos;
           while self.pos < self.data.len() && !is_delim(self.data[self.pos]) {
             self.pos += 1;
           }
-          items.push(Token::Name(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()));
+          let token = Token::Name(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned());
+          items.push(self.lexed(token));
         }
-        Some(c) if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => items.push(Token::Num(self.read_number()?)),
+        Some(c) if c == b'-' || c == b'+' || c == b'.' || c.is_ascii_digit() => {
+          let token = Token::Num(self.read_number()?);
+          items.push(self.lexed(token));
+        }
         Some(_) => {
           let start = self.pos;
           while self.pos < self.data.len() && !is_delim(self.data[self.pos]) && self.data[self.pos] != b']' {
@@ -712,7 +775,8 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
             continue;
           }
-          items.push(Token::Op(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned()));
+          let token = Token::Op(String::from_utf8_lossy(&self.data[start..self.pos]).into_owned());
+          items.push(self.lexed(token));
         }
       }
     }
@@ -894,9 +958,9 @@ fn inline_key(key: &str) -> &str {
   }
 }
 
-fn numbers(ops: &[Token]) -> Vec<f64> {
+fn numbers(ops: &[Lexed]) -> Vec<f64> {
   ops.iter()
-    .filter_map(|t| match t {
+    .filter_map(|t| match &t.token {
       Token::Num(n) => Some(*n),
       _ => None,
     })
@@ -918,6 +982,9 @@ struct Interp<R: ResourceProvider> {
   compat_depth: u32,
   depth: u32,
   items: Vec<PageItem>,
+  /// `/Contents` segments of the buffer being interpreted; maps an
+  /// offset back to the stream object for `OpSpan::container`.
+  segments: Vec<ContentSegment>,
 }
 
 /// Interpret a decoded content stream into page items.
@@ -927,9 +994,34 @@ pub fn interpret<R: ResourceProvider>(content: &[u8], res: R) -> Result<Vec<Page
 
 /// Interpret with a base CTM (form XObjects) and nesting depth.
 pub fn interpret_with<R: ResourceProvider>(content: &[u8], res: R, base_ctm: Matrix, depth: u32) -> Result<Vec<PageItem>> {
+  interpret_spanned(content, res, base_ctm, depth, &[])
+}
+
+/// Interpret with a base CTM, nesting depth and the `/Contents`
+/// segments of `content`.
+///
+/// Item `OpSpan`s get their `container` from the segment covering their
+/// offset, so an editor knows which stream object to re-encode. Pass
+/// `&[]` when the bytes are not addressable (`container` stays `0`).
+pub fn interpret_spanned<R: ResourceProvider>(
+  content: &[u8],
+  res: R,
+  base_ctm: Matrix,
+  depth: u32,
+  segments: &[ContentSegment],
+) -> Result<Vec<PageItem>> {
   let mut base = State::new();
   base.ctm = base_ctm;
-  let mut it = Interp { res, stack: vec![base], path: Vec::new(), pending_clip: None, compat_depth: 0, depth, items: Vec::new() };
+  let mut it = Interp {
+    res,
+    stack: vec![base],
+    path: Vec::new(),
+    pending_clip: None,
+    compat_depth: 0,
+    depth,
+    items: Vec::new(),
+    segments: segments.to_vec(),
+  };
   it.run(content)?;
   Ok(it.items)
 }
@@ -945,8 +1037,14 @@ impl<R: ResourceProvider> Interp<R> {
 
   fn run(&mut self, content: &[u8]) -> Result<()> {
     let mut lexer = Lexer::new(content);
-    let mut ops: Vec<Token> = Vec::new();
-    while let Some(token) = lexer.next_token()? {
+    let mut ops: Vec<Lexed> = Vec::new();
+    // Byte range of the current operator group: first operand start and
+    // last operand end, so `apply` can record a precise operand span.
+    // `None` while no operand is pending (the operator directly follows
+    // the previous one).
+    let mut operands: Option<(usize, usize)> = None;
+    while let Some(lexed) = lexer.next_token()? {
+      let Lexed { token, start, end } = lexed;
       match token {
         Token::Op(op) => {
           if self.compat_depth > 0 {
@@ -956,29 +1054,68 @@ impl<R: ResourceProvider> Interp<R> {
               self.compat_depth -= 1;
             }
             ops.clear();
+            operands = None;
             continue;
           }
           if op == "BX" {
             self.compat_depth = 1;
             ops.clear();
+            operands = None;
             continue;
           }
-          self.apply(&op, &ops)?;
+          self.apply(&op, &ops, operands, start, end)?;
           ops.clear();
+          operands = None;
         }
         Token::InlineImage { dict, data } => {
           if self.compat_depth == 0 {
             self.inline_image(dict, data)?;
           }
           ops.clear();
+          operands = None;
         }
-        other => ops.push(other),
+        other => {
+          operands = Some(match operands {
+            Some((first, _)) => (first, end),
+            None => (start, end),
+          });
+          ops.push(Lexed { token: other, start, end });
+        }
       }
     }
     Ok(())
   }
 
-  fn apply(&mut self, op: &str, ops: &[Token]) -> Result<()> {
+  /// `OpSpan` for the operator just applied. `operands` is `None` for
+  /// operand-less operators, where the operator bytes are the whole
+  /// region; otherwise it is the first and last operand byte, so
+  /// `operand_range()` covers the operands only (not the operator name).
+  fn op_span(&self, operands: Option<(usize, usize)>, op_start: usize, op_end: usize) -> OpSpan {
+    let anchor = operands.map(|(start, _)| start).unwrap_or(op_start);
+    let (operand_start, operand_end) = operands.unwrap_or((op_start, op_start));
+    OpSpan {
+      container: ContentSegment::container_of(&self.segments, anchor),
+      operand_start: operand_start as u32,
+      operand_end: operand_end as u32,
+      op_start: op_start as u32,
+      op_end: op_end as u32,
+    }
+  }
+
+  /// `OpSpan` whose operand region is exactly one operand token (text
+  /// strings). Points at the raw literal, never the `TJ` array, so
+  /// kerning numbers around it survive a rewrite.
+  fn token_span(&self, operand: &Lexed, op_start: usize, op_end: usize) -> OpSpan {
+    OpSpan {
+      container: ContentSegment::container_of(&self.segments, operand.start),
+      operand_start: operand.start as u32,
+      operand_end: operand.end as u32,
+      op_start: op_start as u32,
+      op_end: op_end as u32,
+    }
+  }
+
+  fn apply(&mut self, op: &str, ops: &[Lexed], operands: Option<(usize, usize)>, op_start: usize, op_end: usize) -> Result<()> {
     match op {
       // Graphics state.
       "q" => {
@@ -996,7 +1133,10 @@ impl<R: ResourceProvider> Interp<R> {
         if n.len() >= 6 {
           let m = Matrix { a: n[0] as f32, b: n[1] as f32, c: n[2] as f32, d: n[3] as f32, e: n[4] as f32, f: n[5] as f32 };
           let ctm = self.state().ctm;
-          self.state_mut().ctm = m.concat(ctm);
+          let span = self.op_span(operands, op_start, op_end);
+          let st = self.state_mut();
+          st.ctm = m.concat(ctm);
+          st.cm_span = Some(span);
         }
       }
       "w" => {
@@ -1026,10 +1166,12 @@ impl<R: ResourceProvider> Interp<R> {
       "d" => {
         let mut dash = Vec::new();
         let mut phase = 0.0;
-        if let Some(Token::Array(items)) = ops.first() {
-          for item in items {
-            if let Token::Num(v) = item {
-              dash.push((*v as f32).max(0.0));
+        if let Some(array) = ops.first().map(|item| &item.token) {
+          if let Token::Array(items) = array {
+            for item in items {
+              if let Token::Num(v) = &item.token {
+                dash.push((*v as f32).max(0.0));
+              }
             }
           }
         }
@@ -1043,7 +1185,7 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "ri" | "i" => {}
       "gs" => {
-        if let Some(name) = ops.first().and_then(token_name) {
+        if let Some(name) = ops.first().and_then(|item| token_name(&item.token)) {
           if let Some(gs) = self.res.extgstate(name) {
             let st = self.state_mut();
             if let Some(w) = gs.lw {
@@ -1182,12 +1324,12 @@ impl<R: ResourceProvider> Interp<R> {
         }
       }
       "CS" => {
-        if let Some(name) = ops.first().and_then(token_name) {
+        if let Some(name) = ops.first().and_then(|item| token_name(&item.token)) {
           self.state_mut().stroke_cs = cs_by_name(name);
         }
       }
       "cs" => {
-        if let Some(name) = ops.first().and_then(token_name) {
+        if let Some(name) = ops.first().and_then(|item| token_name(&item.token)) {
           self.state_mut().fill_cs = cs_by_name(name);
         }
       }
@@ -1202,7 +1344,7 @@ impl<R: ResourceProvider> Interp<R> {
       "ET" => self.state_mut().in_text = false,
       "Tf" => {
         if ops.len() >= 2 {
-          if let Some(name) = token_name(&ops[ops.len() - 2]) {
+          if let Some(name) = token_name(&ops[ops.len() - 2].token) {
             self.state_mut().font = name.to_owned();
           }
           let n = numbers(ops);
@@ -1290,20 +1432,24 @@ impl<R: ResourceProvider> Interp<R> {
       }
       "Tj" => {
         if self.state().in_text {
-          if let Some(Token::Str(bytes)) = ops.last() {
+          if let Some(Token::Str(bytes)) = ops.last().map(|item| &item.token) {
             let bytes = bytes.clone();
-            self.show(&bytes)?;
+            let span = self.token_span(&ops[ops.len() - 1], op_start, op_end);
+            self.show(&bytes, span)?;
           }
         }
       }
       "TJ" => {
         if self.state().in_text {
-          if let Some(Token::Array(items)) = ops.last() {
+          if let Some(Token::Array(items)) = ops.last().map(|item| &item.token) {
             for item in items.clone() {
-              match item {
-                Token::Str(bytes) => self.show(&bytes)?,
+              match &item.token {
+                Token::Str(bytes) => {
+                  let span = self.token_span(&item, op_start, op_end);
+                  self.show(bytes, span)?;
+                }
                 Token::Num(adjust) => {
-                  let dx = -(adjust as f32) * self.state().font_size / 1000.0 * self.state().h_scale;
+                  let dx = -(*adjust as f32) * self.state().font_size / 1000.0 * self.state().h_scale;
                   let tm = self.state().tm;
                   self.state_mut().tm = Matrix::translate(dx, 0.0).concat(tm);
                 }
@@ -1323,9 +1469,10 @@ impl<R: ResourceProvider> Interp<R> {
           let st = self.state_mut();
           st.tlm = moved;
           st.tm = moved;
-          if let Some(Token::Str(bytes)) = ops.last() {
+          if let Some(Token::Str(bytes)) = ops.last().map(|item| &item.token) {
             let bytes = bytes.clone();
-            self.show(&bytes)?;
+            let span = self.token_span(&ops[ops.len() - 1], op_start, op_end);
+            self.show(&bytes, span)?;
           }
         }
       }
@@ -1344,39 +1491,44 @@ impl<R: ResourceProvider> Interp<R> {
           let st = self.state_mut();
           st.tlm = moved;
           st.tm = moved;
-          if let Some(Token::Str(bytes)) = ops.last() {
+          if let Some(Token::Str(bytes)) = ops.last().map(|item| &item.token) {
             let bytes = bytes.clone();
-            self.show(&bytes)?;
+            let span = self.token_span(&ops[ops.len() - 1], op_start, op_end);
+            self.show(&bytes, span)?;
           }
         }
       }
       // XObjects, patterns and shading.
       "Do" => {
-        if let Some(name) = ops.first().and_then(token_name) {
+        if let Some(name) = ops.first().and_then(|item| token_name(&item.token)) {
           let st = self.state();
-          let (ctm, fill, alpha, depth) = (st.ctm, st.fill_rgb, st.fill_alpha, self.depth);
+          let (ctm, fill, alpha, depth, cm_span) = (st.ctm, st.fill_rgb, st.fill_alpha, self.depth, st.cm_span);
           match self.res.xobject(name, ctm, fill, alpha, depth) {
             XObjectResult::Items(mut sub) => self.items.append(&mut sub),
-            XObjectResult::Image(placed) => self.items.push(PageItem::Image(placed)),
+            XObjectResult::Image(placed) => {
+              let mut placed = placed;
+              placed.src = cm_span;
+              self.items.push(PageItem::Image(placed));
+            }
             XObjectResult::Skipped(reason) => self.items.push(PageItem::Skipped(reason)),
           }
         }
       }
       "sh" => {
-        if let Some(name) = ops.first().and_then(token_name) {
+        if let Some(name) = ops.first().and_then(|item| token_name(&item.token)) {
           self.paint_shading(name);
         }
       }
       // Marked content: structure markers, no rendering effect.
       "BMC" => {
-        if let Some(tag) = ops.first().and_then(token_name) {
+        if let Some(tag) = ops.first().and_then(|item| token_name(&item.token)) {
           self.items.push(PageItem::BeginMarked(Marked { tag: tag.into(), prop: None }));
         }
       }
       "BDC" => {
         if ops.len() >= 2 {
-          let tag = token_name(&ops[0]).unwrap_or("").to_owned();
-          let prop = match &ops[1] {
+          let tag = token_name(&ops[0].token).unwrap_or("").to_owned();
+          let prop = match &ops[1].token {
             Token::Name(n) => Some(n.clone()),
             Token::Dict(_) => Some(String::from("<dict>")),
             _ => None,
@@ -1452,6 +1604,7 @@ impl<R: ResourceProvider> Interp<R> {
       _ => None,
     };
     let ctm = st.ctm;
+    let cm_span = st.cm_span;
     let fill_alpha = st.fill_alpha;
     let stroke_alpha = st.stroke_alpha;
     if op == "n" && self.pending_clip.is_none() {
@@ -1467,6 +1620,7 @@ impl<R: ResourceProvider> Interp<R> {
         stroke,
         stroke_alpha,
         clip: self.pending_clip.map(norm),
+        src: cm_span,
       }));
     }
     self.pending_clip = None;
@@ -1499,11 +1653,11 @@ impl<R: ResourceProvider> Interp<R> {
     }
   }
 
-  fn set_color(&mut self, ops: &[Token], stroking: bool) -> Result<()> {
+  fn set_color(&mut self, ops: &[Lexed], stroking: bool) -> Result<()> {
     // A trailing name in SCN/scn selects a pattern; numeric operands
     // before it are the base color for uncolored tiling patterns.
     // Tiling renders later, so only the reference is kept.
-    if let Some(name) = ops.last().and_then(token_name) {
+    if let Some(name) = ops.last().and_then(|item| token_name(&item.token)) {
       if self.res.pattern(name).is_some() {
         self.items.push(PageItem::Pattern(name.to_owned()));
         return Ok(());
@@ -1559,7 +1713,7 @@ impl<R: ResourceProvider> Interp<R> {
     Ok(())
   }
 
-  fn show(&mut self, bytes: &[u8]) -> Result<()> {
+  fn show(&mut self, bytes: &[u8], src: OpSpan) -> Result<()> {
     if bytes.is_empty() || !self.state().in_text {
       return Ok(());
     }
@@ -1606,6 +1760,7 @@ impl<R: ResourceProvider> Interp<R> {
       dir_x: dx,
       dir_y: dy,
       alpha,
+      src: Some(src),
     }));
     let tm = self.state().tm;
     self.state_mut().tm = Matrix::translate(advance, 0.0).concat(tm);
@@ -1614,11 +1769,15 @@ impl<R: ResourceProvider> Interp<R> {
 
   fn inline_image(&mut self, dict: Vec<(String, Token)>, data: Vec<u8>) -> Result<()> {
     let st = self.state();
-    let (ctm, fill, alpha) = (st.ctm, st.fill_rgb, st.fill_alpha);
+    let (ctm, fill, alpha, cm_span) = (st.ctm, st.fill_rgb, st.fill_alpha, st.cm_span);
     let neutral: Vec<(String, InlineVal)> = dict.into_iter().map(|(k, v)| (k, InlineVal::from_token(&v))).collect();
     match self.res.inline_image(&neutral, &data, ctm, fill, alpha) {
       XObjectResult::Items(mut sub) => self.items.append(&mut sub),
-      XObjectResult::Image(placed) => self.items.push(PageItem::Image(placed)),
+      XObjectResult::Image(placed) => {
+        let mut placed = placed;
+        placed.src = cm_span;
+        self.items.push(PageItem::Image(placed));
+      }
       XObjectResult::Skipped(reason) => self.items.push(PageItem::Skipped(reason)),
     }
     Ok(())
@@ -1913,5 +2072,117 @@ mod tests {
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0].text, "show");
     assert!(runs[0].x > 60.0, "tail must advance past hidden text, x={}", runs[0].x);
+  }
+
+  /// Span of the first text run, asserting it is present.
+  fn first_span(content: &[u8]) -> OpSpan {
+    let items = interpret(content, provider()).unwrap();
+    texts(&items).first().and_then(|run| run.src).expect("run carries a source span")
+  }
+
+  #[test]
+  fn text_span_points_at_the_raw_literal() {
+    // The whole point of the span: slicing the content with it must
+    // hand back exactly the literal that produced the run.
+    let content = b"BT /F1 12 Tf 10 20 Td (Hello) Tj ET";
+    let span = first_span(content);
+    let (start, end) = span.operand_range();
+    assert_eq!(&content[start..end], b"(Hello)");
+    assert_eq!(&content[span.op_range().0..span.op_range().1], b"Tj");
+  }
+
+  #[test]
+  fn hex_string_span_keeps_delimiters() {
+    let content = b"BT /F1 12 Tf <48656C6C6F> Tj ET";
+    let span = first_span(content);
+    assert_eq!(&content[span.operand_range().0..span.operand_range().1], b"<48656C6C6F>");
+  }
+
+  #[test]
+  fn tj_spans_target_inner_strings_not_the_array() {
+    // A rewrite must touch one string only, so kerning numbers around
+    // it survive. Spans of both runs point at their own literal.
+    let content = b"BT /F1 12 Tf [(ab) -120 (cd)] TJ ET";
+    let items = interpret(content, provider()).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 2);
+    let a = runs[0].src.unwrap();
+    let b = runs[1].src.unwrap();
+    assert_eq!(&content[a.operand_range().0..a.operand_range().1], b"(ab)");
+    assert_eq!(&content[b.operand_range().0..b.operand_range().1], b"(cd)");
+    assert_eq!(&content[a.op_range().0..a.op_range().1], b"TJ");
+  }
+
+  #[test]
+  fn span_container_resolves_through_segments() {
+    // Two /Contents streams: every run reports the object that owns
+    // its bytes, so the editor rewrites the right stream.
+    let content = b"BT /F1 12 Tf (one) Tj ET\nBT /F1 12 Tf (two) Tj ET";
+    let segments = [
+      ContentSegment { obj: 7, start: 0, end: 25 },
+      ContentSegment { obj: 9, start: 26, end: content.len() },
+    ];
+    let items = interpret_spanned(content, provider(), Matrix::ident(), 0, &segments).unwrap();
+    let runs = texts(&items);
+    assert_eq!(runs.len(), 2);
+    assert_eq!(runs[0].src.unwrap().container, 7);
+    assert_eq!(runs[1].src.unwrap().container, 9);
+    assert_eq!(&content[runs[1].src.unwrap().operand_range().0..runs[1].src.unwrap().operand_range().1], b"(two)");
+  }
+
+  #[test]
+  fn anonymous_interpret_has_container_zero() {
+    let content = b"BT /F1 12 Tf (x) Tj ET";
+    let span = first_span(content);
+    assert_eq!(span.container, 0);
+    // Offsets stay usable for callers that hold the bytes themselves.
+    assert_eq!(&content[span.operand_range().0..span.operand_range().1], b"(x)");
+  }
+
+  #[test]
+  fn cm_span_marks_path_and_image_placement() {
+    // Path and image items carry the `cm` that placed them, so an
+    // editor can move, scale or rotate them.
+    let content = b"2 0 0 2 30 40 cm 0 0 10 10 re f";
+    let items = interpret(content, provider()).unwrap();
+    let path = items
+      .iter()
+      .find_map(|item| match item {
+        PageItem::Path(path) => Some(path),
+        _ => None,
+      })
+      .expect("path painted");
+    let span = path.src.expect("path carries its cm span");
+    assert_eq!(&content[span.operand_range().0..span.operand_range().1], b"2 0 0 2 30 40");
+    assert_eq!(&content[span.op_range().0..span.op_range().1], b"cm");
+    // Operands end before the separating space; the operator name is
+    // its own range, so a rewrite never has to re-lex the operator.
+    assert_eq!((span.operand_start, span.operand_end, span.op_start, span.op_end), (0, 13, 14, 16));
+  }
+
+  #[test]
+  fn cm_span_is_saved_and_restored() {
+    // `Q` restores the outer CTM, so a path painted after it must not
+    // claim the inner `cm`.
+    let content = b"q 5 0 0 5 0 0 cm Q 0 0 10 10 re f";
+    let items = interpret(content, provider()).unwrap();
+    let path = items
+      .iter()
+      .find_map(|item| match item {
+        PageItem::Path(path) => Some(path),
+        _ => None,
+      })
+      .expect("path painted");
+    assert!(path.src.is_none(), "outer state restored, got {:?}", path.src);
+    assert_eq!(path.ctm.a, 1.0);
+  }
+
+  #[test]
+  fn spans_survive_damaged_prefix() {
+    // Offsets are absolute in the buffer, so leading junk shifts them
+    // but must not break the mapping.
+    let content = b") ] >> \x00 BT /F1 12 Tf (ok) Tj ET ]";
+    let span = first_span(content);
+    assert_eq!(&content[span.operand_range().0..span.operand_range().1], b"(ok)");
   }
 }

@@ -50,6 +50,33 @@ Streams decrypt with the stream filter, strings with the string
 filter; the `/Encrypt` dict, trailer `/ID` and xref streams stay raw.
 Objects inside object streams use their stream's number.
 
+## Content segments
+
+A page's `/Contents` may be one stream or an array of streams. PDFKit
+decodes every entry and concatenates them with a newline separator
+(ISO 32000 7.8.2: the array is logically a single stream), then records
+where each stream landed.
+
+```rust
+pub struct ContentSegment {
+  /// Object number of the content stream.
+  pub obj: u32,
+  /// First byte of this stream inside the concatenated buffer.
+  pub start: usize,
+  /// One past the last byte of this stream.
+  pub end: usize,
+}
+```
+
+| Function | Behavior |
+|---|---|
+| `ContentSegment::container_of` | Object number covering a byte offset, `0` outside every segment |
+
+The trailing separator after the last stream lies outside every
+segment. `ParsedPage` and `PdfPage` both expose `content` plus
+`content_segments`, so an editor can map an item back to the exact
+stream object it has to re-encode.
+
 ## Types
 
 ```rust

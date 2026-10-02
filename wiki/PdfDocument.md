@@ -20,8 +20,18 @@ pub struct PdfPage {
   pub runs: Vec<PdfTextRun>,
   pub items: Vec<PageItem>,
   pub annotations: Vec<Annotation>,
+  pub rotate: i32,
+  pub content: Vec<u8>,
+  pub content_segments: Vec<ContentSegment>,
 }
 ```
+
+`content` holds the decoded content stream bytes of the page (all
+`/Contents` entries concatenated) and `content_segments` maps every
+entry to its object number and byte range. Item `OpSpan` offsets index
+`content`, so the pair is what an editor rewrites; see
+[Graphics.md](Graphics.md) for spans and
+[DocumentStructure.md](DocumentStructure.md) for segments.
 
 See [Graphics.md](Graphics.md) for `PageItem`, [Fonts.md](Fonts.md) for
 `PdfTextRun` and [Annotations.md](Annotations.md) for `Annotation`.

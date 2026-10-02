@@ -45,10 +45,16 @@ See [PdfDocument.md](PdfDocument.md) for details.
 
 ## Changelog
 
-- 2026-10-02: Text run positions moved out of the layout cache into
-  draw-time mapping: run origins follow `place()` without re-typesetting,
-  so stacked/scrolled viewers no longer pile every page's text on one
-  spot while paths and images stay in place.
+- 2026-10-02: Editor foundation. Content tokens carry byte ranges end
+  to end: `OpSpan` on text runs (pointing at their own string, never
+  the `TJ` array), paths and images (pointing at the active `cm`);
+  `PdfPage` keeps `content` plus `content_segments` mapping every
+  `/Contents` entry to its object number. Form XObject bodies are
+  addressable too. This is what byte-exact edits and the incremental
+  save in the next milestones build on. Read-only until then.
+- 2026-10-02: Stacked/scrolled viewers place run text correctly again
+  (run origins are mapped at draw time instead of being cached with
+  the first `measure()` position).
 - 2026-09-28: Visual compare loop fully green (105/105): rotated
   text and page `/Rotate`, spec-correct LZW codes, calibrated CMYK
   table, CropBox frames, stencil polarity, annotation verdicts.

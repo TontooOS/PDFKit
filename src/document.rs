@@ -6,12 +6,12 @@ use crate::error::{PdfError, Result};
 use crate::font::{DecoderKind, FontDecoder, apply_differences, parse_cmap};
 use crate::graphics::{
   ExtGState, FillRule, FontInfo, InlineVal, Matrix, MAX_FORM_DEPTH, PathItem, PathSeg, PlacedImage, ResourceProvider,
-  Rgb, XObjectResult, interpret, interpret_with, text_runs,
+  Rgb, XObjectResult, interpret_spanned, text_runs,
 };
 use crate::image::{apply_alpha, apply_constant_alpha, decode_jpeg, decode_mask_alpha, decode_samples, decode_smask_alpha};
 use crate::objects::PdfValue;
 use crate::page::PdfPage;
-use crate::parser::FileParser;
+use crate::parser::{ContentSegment, FileParser};
 
 /// A loaded PDF document: parsed structure plus interpreted pages.
 ///
@@ -67,7 +67,7 @@ impl PdfDocument {
         fonts.insert(font.resource.clone(), info);
       }
       let provider = DocProvider { parser, resources: item.resources.clone(), fonts };
-      let items = interpret(&item.content, provider)?;
+      let items = interpret_spanned(&item.content, provider, Matrix::ident(), 0, &item.content_segments)?;
       let runs = text_runs(&items);
       let width = (item.media_box[2] - item.media_box[0]).max(1.0);
       let height = (item.media_box[3] - item.media_box[1]).max(1.0);
@@ -87,6 +87,8 @@ impl PdfDocument {
         items,
         annotations,
         rotate: item.rotate,
+        content: item.content.clone(),
+        content_segments: item.content_segments.clone(),
       });
     }
     if pages.is_empty() {
@@ -498,9 +500,9 @@ impl<'a> ResourceProvider for DocProvider<'a> {
     };
     let subtype = obj.value.get("Subtype").and_then(|v| v.as_name()).unwrap_or("").to_owned();
     match subtype.as_str() {
-      "Form" => self.place_form(&obj.value, &raw, ctm, depth),
+      "Form" => self.place_form(&obj.value, &raw, ctm, depth, num),
       "Image" => match self.decode_image(&obj.value, &raw, fill, alpha) {
-        Some(image) => XObjectResult::Image(PlacedImage { image, ctm }),
+        Some(image) => XObjectResult::Image(PlacedImage { image, ctm, src: None }),
         None => XObjectResult::Skipped(String::from("unsupported image")),
       },
       _ => XObjectResult::Skipped(String::from("unknown XObject subtype")),
@@ -524,7 +526,7 @@ impl<'a> ResourceProvider for DocProvider<'a> {
       return match decode_jpeg(data) {
         Some(mut image) => {
           apply_constant_alpha(&mut image.rgba, alpha);
-          XObjectResult::Image(PlacedImage { image, ctm })
+          XObjectResult::Image(PlacedImage { image, ctm, src: None })
         }
         None => XObjectResult::Skipped(String::from("bad JPEG data")),
       };
@@ -534,14 +536,14 @@ impl<'a> ResourceProvider for DocProvider<'a> {
       Err(_) => return XObjectResult::Skipped(String::from("inline filter failed")),
     };
     match self.decode_image(&value, &samples, fill, alpha) {
-      Some(image) => XObjectResult::Image(PlacedImage { image, ctm }),
+      Some(image) => XObjectResult::Image(PlacedImage { image, ctm, src: None }),
       None => XObjectResult::Skipped(String::from("unsupported inline image")),
     }
   }
 }
 
 impl<'a> DocProvider<'a> {
-  fn place_form(&self, dict: &PdfValue, raw: &[u8], ctm: Matrix, depth: u32) -> XObjectResult {
+  fn place_form(&self, dict: &PdfValue, raw: &[u8], ctm: Matrix, depth: u32, objnum: u32) -> XObjectResult {
     let content = match crate::filter::decode(dict, raw) {
       Ok(content) => content,
       Err(_) => return XObjectResult::Skipped(String::from("form filter failed")),
@@ -567,7 +569,10 @@ impl<'a> DocProvider<'a> {
       .and_then(|v| self.parser.resolve_value(v).ok())
       .unwrap_or_else(|| self.resources.clone());
     let sub = DocProvider { parser: self.parser, resources, fonts: self.fonts.clone() };
-    let mut items = match interpret_with(&content, sub, base, depth + 1) {
+    // The form body is its own content stream: tag its spans with the
+    // form object number so an editor can address its bytes.
+    let segments = [ContentSegment { obj: objnum, start: 0, end: content.len() }];
+    let mut items = match interpret_spanned(&content, sub, base, depth + 1, &segments) {
       Ok(items) => items,
       Err(_) => return XObjectResult::Skipped(String::from("form content failed")),
     };
@@ -592,6 +597,7 @@ impl<'a> DocProvider<'a> {
             stroke: None,
             stroke_alpha: 1.0,
             clip: Some(FillRule::NonZero),
+            src: None,
           }),
         ];
         framed.append(&mut items);
@@ -982,6 +988,100 @@ mod tests {
     let doc = PdfDocument::load_bytes(pdf).unwrap();
     assert_eq!(doc.page_count(), 1);
     assert!(doc.page(0).unwrap().text().contains("Hello PDF"));
+  }
+
+  /// PDF with a `/Contents` array of two streams, so page content is
+  /// the concatenation of two separately addressable objects.
+  fn two_stream_pdf(first: &[u8], second: &[u8]) -> Vec<u8> {
+    let stream = |body: &[u8]| {
+      [b"<< /Length ".to_vec(), body.len().to_string().into_bytes(), b" >>\nstream\n".to_vec(), body.to_vec(), b"\nendstream".to_vec()].concat()
+    };
+    let objects: Vec<Vec<u8>> = vec![
+      b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+      b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+      b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents [4 0 R 5 0 R] /Resources << /Font << /F1 6 0 R >> >> >>".to_vec(),
+      stream(first),
+      stream(second),
+      b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, body) in objects.iter().enumerate() {
+      offsets.push(pdf.len());
+      pdf.extend_from_slice(format!("{} 0 obj\n", i + 1).as_bytes());
+      pdf.extend_from_slice(body);
+      pdf.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", objects.len() + 1).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+      pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(b"trailer\n<< /Size 7 /Root 1 0 R >>\nstartxref\n");
+    pdf.extend_from_slice(xref.to_string().as_bytes());
+    pdf.extend_from_slice(b"\n%%EOF");
+    pdf
+  }
+
+  #[test]
+  fn page_keeps_content_bytes_and_segments() {
+    let pdf = two_stream_pdf(b"BT /F1 12 Tf (one) Tj ET", b"BT /F1 12 Tf (two) Tj ET");
+    let doc = PdfDocument::load_bytes(pdf).unwrap();
+    let page = doc.page(0).unwrap();
+    // The page buffer is the concatenation of both streams, and each
+    // segment names the object owning that byte range.
+    assert_eq!(page.content_segments[0].end, b"BT /F1 12 Tf (one) Tj ET".len());
+    assert_eq!(page.content_segments.len(), 2);
+    assert_eq!(page.content_segments[0].obj, 4);
+    assert_eq!(page.content_segments[1].obj, 5);
+    // A newline separates the concatenated streams, so the second
+    // segment starts one byte after the first one ends, and the
+    // trailing separator sits outside every segment.
+    assert_eq!(page.content_segments[1].start, page.content_segments[0].end + 1);
+    assert_eq!(page.content_segments[1].end, b"BT /F1 12 Tf (two) Tj ET".len() + page.content_segments[1].start);
+    assert_eq!(page.content_segments[1].end + 1, page.content.len());
+    assert_eq!(page.content[page.content_segments[0].end], b'\n');
+  }
+
+  #[test]
+  fn run_spans_slice_real_page_bytes() {
+    // End to end: a span taken off a parsed page must index the page's
+    // own content buffer and name the stream object to rewrite.
+    let pdf = two_stream_pdf(b"BT /F1 12 Tf (first) Tj ET", b"BT /F1 12 Tf 0 -20 Td (second) Tj ET");
+    let doc = PdfDocument::load_bytes(pdf).unwrap();
+    let page = doc.page(0).unwrap();
+    assert_eq!(page.runs.len(), 2);
+
+    let a = page.runs[0].src.expect("first run is addressable");
+    assert_eq!(a.container, 4);
+    assert_eq!(&page.content[a.operand_range().0..a.operand_range().1], b"(first)");
+
+    let b = page.runs[1].src.expect("second run is addressable");
+    assert_eq!(b.container, 5);
+    assert_eq!(&page.content[b.operand_range().0..b.operand_range().1], b"(second)");
+
+    // The container must agree with the segment table, otherwise a save
+    // would rewrite the wrong stream.
+    assert_eq!(ContentSegment::container_of(&page.content_segments, a.operand_start as usize), a.container);
+    assert_eq!(ContentSegment::container_of(&page.content_segments, b.operand_start as usize), b.container);
+  }
+
+  #[test]
+  fn replacing_a_run_bytes_leaves_valid_content() {
+    // What M3 will do, proven here: splicing the content buffer at the
+    // span and re-parsing yields the new text and nothing else.
+    let pdf = two_stream_pdf(b"BT /F1 12 Tf (first) Tj ET", b"BT /F1 12 Tf (second) Tj ET");
+    let doc = PdfDocument::load_bytes(pdf).unwrap();
+    let page = doc.page(0).unwrap();
+    let span = page.runs[0].src.expect("run is addressable");
+    let (start, end) = span.operand_range();
+
+    let mut patched = page.content.clone();
+    patched.splice(start..end, b"(EDITED)".iter().copied());
+    let runs = crate::page::interpret_content(&patched, &[]).expect("patched content still parses");
+    assert_eq!(runs[0].text, "EDITED");
+    assert_eq!(runs[1].text, "second");
   }
 
   #[test]

@@ -65,7 +65,51 @@ pub fn interpret<R: ResourceProvider>(content: &[u8], res: R) -> Result<Vec<Page
 pub fn interpret_with<R: ResourceProvider>(content: &[u8], res: R, base_ctm: Matrix, depth: u32) -> Result<Vec<PageItem>>
 ```
 
+```rust
+pub fn interpret_spanned<R: ResourceProvider>(content: &[u8], res: R, base_ctm: Matrix, depth: u32, segments: &[ContentSegment]) -> Result<Vec<PageItem>>
+```
+
 Form nesting past `MAX_FORM_DEPTH` (8) yields `Skipped`.
+
+## Source spans
+
+`interpret_spanned` stamps each item with the byte range that produced
+it, so an editor can rewrite exactly those bytes instead of
+reconstructing the stream.
+
+```rust
+pub struct OpSpan {
+  /// Object number of the content stream holding the bytes; `0` when
+  /// the buffer is not addressable.
+  pub container: u32,
+  pub operand_start: u32,
+  pub operand_end: u32,
+  pub op_start: u32,
+  pub op_end: u32,
+}
+```
+
+| Field pair | Covers |
+|---|---|
+| `operand_range()` | The operand region a rewrite replaces |
+| `op_range()` | The operator name |
+
+| Item | `src` points at |
+|---|---|
+| `PdfTextRun` | Its own string literal, never the `TJ` array |
+| `PathItem` | The `cm` active when the path was painted |
+| `PlacedImage` | The `cm` active at `Do` (or `BI`) |
+
+Notes:
+
+- For a `TJ` array every inner string gets its own span, so replacing
+  one run leaves the surrounding kerning numbers untouched.
+- `q`/`Q` save and restore the span with the rest of the state, so a
+  path painted after `Q` does not claim the inner `cm`.
+- Form XObject bodies pass a single segment carrying the form's object
+  number, which makes text inside forms addressable too.
+- `interpret` and `interpret_with` pass no segments: offsets stay
+  usable, `container` is `0`.
 
 ## Usage / Example
 

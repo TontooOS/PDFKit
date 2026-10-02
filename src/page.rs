@@ -1,7 +1,43 @@
 use crate::annot::Annotation;
 use crate::error::Result;
 use crate::graphics::{FontInfo, MapResources, PageItem, interpret, text_runs};
-use crate::parser::PageFont;
+use crate::parser::{ContentSegment, PageFont};
+
+/// Byte ranges of one content-stream operator, so an editor can rewrite
+/// exactly the bytes that produced an item.
+///
+/// Offsets index the *decoded* content buffer the interpreter ran
+/// over. `PdfPage` keeps that buffer plus a `ContentSegment` table, so
+/// `container` maps an offset back to the stream object that has to be
+/// re-encoded on save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpSpan {
+  /// Object number of the content stream holding the bytes. `0` when
+  /// the bytes are not addressable (anonymous buffers, plain `interpret`).
+  pub container: u32,
+  /// First byte of the operand region a text/path edit replaces. For a
+  /// text run this is the string literal itself (`(...)` or `<...>`),
+  /// never the surrounding `TJ` array, so kerning numbers survive.
+  pub operand_start: u32,
+  /// One past the last byte of the operand region.
+  pub operand_end: u32,
+  /// First byte of the operator name.
+  pub op_start: u32,
+  /// One past the last byte of the operator name.
+  pub op_end: u32,
+}
+
+impl OpSpan {
+  /// Operand byte range; the region a rewrite replaces.
+  pub fn operand_range(&self) -> (usize, usize) {
+    (self.operand_start as usize, self.operand_end as usize)
+  }
+
+  /// Operator-name byte range.
+  pub fn op_range(&self) -> (usize, usize) {
+    (self.op_start as usize, self.op_end as usize)
+  }
+}
 
 /// One positioned text run on a page.
 ///
@@ -33,6 +69,10 @@ pub struct PdfTextRun {
   pub dir_y: f32,
   /// Fill alpha from `ca` (`1.0` opaque).
   pub alpha: f32,
+  /// Byte ranges of the operator and string literal that produced this
+  /// run. `None` for runs without addressable source bytes (anonymous
+  /// content buffers, strings built by `BI`/`ID` inline images).
+  pub src: Option<OpSpan>,
 }
 
 /// A fully interpreted page: size plus the vector/text item model.
@@ -61,6 +101,13 @@ pub struct PdfPage {
   /// `/Rotate` in degrees clockwise (0/90/180/270); applied by the
   /// view mapping, content stays in unrotated user space.
   pub rotate: i32,
+  /// Decoded content-stream bytes (all `/Contents` entries concatenated,
+  /// separated by a newline). Item `OpSpan`s index this buffer.
+  pub content: Vec<u8>,
+  /// Object number plus byte range of each `/Contents` entry inside
+  /// `content`. Resolves an `OpSpan` to the stream object an editor
+  /// has to re-encode when saving.
+  pub content_segments: Vec<ContentSegment>,
 }
 
 impl PdfPage {
@@ -91,7 +138,19 @@ impl PdfPage {
     let provider = MapResources { fonts: fonts.iter().map(|f| (f.resource.clone(), FontInfo::simple(&f.resource, &f.base_font))).collect() };
     let items = interpret(content, provider)?;
     let runs = text_runs(&items);
-    Ok(Self { number, width, height, origin_x: media_box[0], origin_y: media_box[1], runs, items, annotations: Vec::new(), rotate: 0 })
+    Ok(Self {
+      number,
+      width,
+      height,
+      origin_x: media_box[0],
+      origin_y: media_box[1],
+      runs,
+      items,
+      annotations: Vec::new(),
+      rotate: 0,
+      content: content.to_vec(),
+      content_segments: Vec::new(),
+    })
   }
 }
 

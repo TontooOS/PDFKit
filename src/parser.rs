@@ -27,6 +27,27 @@ pub struct PageFont {
   pub base_font: String,
 }
 
+/// One `/Contents` entry of a page inside the concatenated content
+/// buffer. `OpSpan` offsets are global, so this table maps them back to
+/// the stream object an editor must re-encode on save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentSegment {
+  /// Object number of the content stream.
+  pub obj: u32,
+  /// First byte of this stream inside the concatenated buffer.
+  pub start: usize,
+  /// One past the last byte of this stream.
+  pub end: usize,
+}
+
+impl ContentSegment {
+  /// Object number covering `offset`, or `0` when it lies outside every
+  /// segment (padding between streams, damaged input).
+  pub fn container_of(segments: &[ContentSegment], offset: usize) -> u32 {
+    segments.iter().rev().find(|seg| offset >= seg.start).map(|seg| seg.obj).unwrap_or(0)
+  }
+}
+
 /// One page found by walking the page tree.
 #[derive(Debug, Clone)]
 pub struct ParsedPage {
@@ -38,6 +59,9 @@ pub struct ParsedPage {
   pub media_box: [f32; 4],
   /// Decoded content stream bytes (all `/Contents` concatenated).
   pub content: Vec<u8>,
+  /// One entry per `/Contents` stream: object number and byte range
+  /// inside `content`. Empty when the page has no content stream.
+  pub content_segments: Vec<ContentSegment>,
   /// Fonts declared in the page resources.
   pub fonts: Vec<PageFont>,
   /// Resolved `/Resources` dict (inherited); `Null` when absent.
@@ -569,7 +593,7 @@ impl FileParser {
       let index = out.len();
       let media_box = Self::media_box(display);
       let rotate = Self::page_rotate(node.value.get("Rotate"));
-      let content = self.page_content(&node.value)?;
+      let (content, content_segments) = self.page_content(&node.value)?;
       let resolved_res = self.resolve(resources).unwrap_or(PdfValue::Null);
       let fonts = self.page_fonts(&resolved_res)?;
       let annots = node
@@ -578,7 +602,7 @@ impl FileParser {
         .and_then(|v| self.resolve(v).ok())
         .and_then(|v| v.as_array().map(|a| a.to_vec()))
         .unwrap_or_default();
-      out.push(ParsedPage { objnum: node_num, index, media_box, content, fonts, resources: resolved_res, annots, rotate });
+      out.push(ParsedPage { objnum: node_num, index, media_box, content, content_segments, fonts, resources: resolved_res, annots, rotate });
       return Ok(());
     }
     let kids = node
@@ -613,31 +637,39 @@ impl FileParser {
     box_vals
   }
 
-  fn page_content(&self, page: &PdfValue) -> Result<Vec<u8>> {
+  fn page_content(&self, page: &PdfValue) -> Result<(Vec<u8>, Vec<ContentSegment>)> {
     let contents = page.get("Contents");
     let mut out = Vec::new();
+    let mut segments: Vec<ContentSegment> = Vec::new();
+    // One /Contents entry: record the span while appending so a later
+    // edit knows which stream object to rewrite. Decode errors keep
+    // propagating exactly as before.
+    fn push(out: &mut Vec<u8>, segments: &mut Vec<ContentSegment>, obj: u32, bytes: Vec<u8>) {
+      let start = out.len();
+      out.extend_from_slice(&bytes);
+      segments.push(ContentSegment { obj, start, end: out.len() });
+    }
     match contents {
-      None => Ok(out),
+      None => Ok((out, segments)),
       Some(PdfValue::Ref(num, _)) => {
-        out.extend(self.decoded_content(*num)?);
-        Ok(out)
+        push(&mut out, &mut segments, *num, self.decoded_content(*num)?);
+        Ok((out, segments))
       }
       Some(PdfValue::Array(items)) => {
         for item in items {
           if let Some((num, _)) = item.as_ref() {
-            let bytes = self.decoded_content(num)?;
-            out.extend(bytes);
+            push(&mut out, &mut segments, num, self.decoded_content(num)?);
             out.push(b'\n');
           }
         }
-        Ok(out)
+        Ok((out, segments))
       }
       Some(other) => {
         let resolved = self.resolve(other)?;
         match resolved {
           PdfValue::Ref(num, _) => {
-            out.extend(self.decoded_content(num)?);
-            Ok(out)
+            push(&mut out, &mut segments, num, self.decoded_content(num)?);
+            Ok((out, segments))
           }
           _ => Err(PdfError::InvalidObject("/Contents must be a stream reference".into())),
         }
