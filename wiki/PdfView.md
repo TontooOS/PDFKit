@@ -48,14 +48,57 @@ Creates a view over `doc`, showing page 0 at 1x zoom.
 
 - `measure` returns the zoomed page size (`width * zoom`, `height * zoom`,
   swapped for `/Rotate` 90/270).
-- `place` stores the page rect at the given origin.
+- `place` stores the page rect at the given origin before any layout work
+  runs, so every paint path sees the current position.
 - `draw` fills the paper, replays items (paths with clip stack,
   gradients, images, text) and paints annotations on top.
 - Rotated text (`cm` rotation) draws through a rigid Vello glyph
   transform about the glyph origin; page `/Rotate` maps every item
   into the rotated display frame. Page size follows the CropBox.
 
+## Text positioning
+
+Text run origins are **not** baked into the layout cache. Each cached
+`RunLayout` keeps the baseline origin in PDF user space plus the
+measured first-line baseline in device px; the view-space draw origin is
+computed at draw time from the current `place()` position.
+
+| Call | Layout rebuild | Position |
+|---|---|---|
+| `measure` then `place` | once | follows `place` |
+| `place` move (scroll, page stack) | no rebuild | follows `place` |
+| `set_page`, `set_zoom`, scale change | rebuild | follows `place` |
+
+> **Note:** Rebuilding layouts on every `place` move is not needed and
+> would re-typeset all runs per scroll frame. A stacked viewer (one
+> `PdfView` per page, `measure` then `place` at increasing `y`) therefore
+> shows each page's text on its own page instead of piling every page's
+> text on the first position while paths and images stay in place.
+
 ## Usage / Example
+
+Stacked pages (one view per page, page rect from `measure`):
+
+```rust
+use pdfkit::{PdfDocument, PdfView};
+use tontooui::elements::layout::View;
+use tontooui::renderer::FontSystem;
+
+let mut fonts = FontSystem::new();
+let mut views: Vec<PdfView> = (0..doc.page_count())
+  .map(|n| {
+    let mut v = PdfView::new(PdfDocument::load_file("/path/to/file.pdf").unwrap());
+    v.set_page(n);
+    v
+  })
+  .collect();
+let mut y = 16.0;
+for view in &mut views {
+  let (w, h) = view.measure(&mut fonts);
+  view.place(&mut fonts, 0.0, y, w, h);
+  y += h + 24.0;
+}
+```
 
 ```rust
 use pdfkit::{PdfDocument, PdfView};

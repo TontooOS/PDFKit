@@ -24,11 +24,17 @@ pub const PDF_TEXT_DARK: Color = Color::from_rgb8(216, 217, 217);
 /// Default PDF text color in light mode (kept for API compatibility).
 pub const PDF_TEXT_LIGHT: Color = Color::from_rgb8(39, 39, 39);
 
-/// One laid-out text run with its view position.
+/// One laid-out text run. The position is kept in PDF user space, not
+/// view space: the layout cache must survive `place()` moves (scrolling,
+/// multi-page stacks) or every page would draw its text at the stale
+/// offset from the first `measure()`.
 struct RunLayout {
   layout: CTLine,
-  x: f32,
-  y: f32,
+  /// Baseline origin in PDF user space (CTM already baked in).
+  ux: f32,
+  uy: f32,
+  /// Measured first-line baseline of `layout` in device px.
+  baseline: f32,
 }
 
 /// A real page-based PDF view for TontooUI.
@@ -166,23 +172,20 @@ impl PdfView {
     (p.x as f32, p.y as f32)
   }
 
-  /// View position of a run: the CoreText pipeline draws in device
-  /// px (`fonts.scale` per logical px), while paths and the paper use
-  /// zoomed points. The layout is therefore built at
+  /// Draw origin of a run in `draw_line` units. The CoreText pipeline
+  /// draws in device px (`fonts.scale` per logical px), while paths and
+  /// the paper use zoomed points. The layout is therefore built at
   /// `font_size * zoom / scale` so its device advances land back on
   /// zoomed points, and the draw origin is pre-divided by `scale`
   /// (the draw call re-multiplies). The vertical origin is the PDF
   /// baseline minus the measured first-line baseline of the laid-out
   /// line, not a `font_size` estimate.
-  fn run_origin(
-    &self,
-    run: &PdfTextRun,
-    page: &crate::page::PdfPage,
-    baseline_device: f32,
-    scale: f32,
-  ) -> (f32, f32) {
-    let (px, py) = self.map_point(page, run.x, run.y);
-    (px / scale, (py - baseline_device) / scale)
+  ///
+  /// Mapped at draw time from the user-space origin so the layout cache
+  /// stays independent of the current `place()` position.
+  fn run_draw_origin(&self, run: &RunLayout, page: &crate::page::PdfPage, scale: f32) -> (f32, f32) {
+    let (px, py) = self.map_point(page, run.ux, run.uy);
+    (px / scale, (py - run.baseline) / scale)
   }
 
   fn ensure_layouts(&mut self, fonts: &mut FontSystem) {
@@ -211,8 +214,7 @@ impl PdfView {
           0.0,
         );
         let baseline = line_baseline(&layout);
-        let (x, y) = self.run_origin(run, &page, baseline, scale);
-        self.runs.push(RunLayout { layout, x, y });
+        self.runs.push(RunLayout { layout, ux: run.x, uy: run.y, baseline });
       }
     }
     self.layout_scale = fonts.scale;
@@ -277,12 +279,13 @@ impl PdfView {
         PageItem::Text(pdf_run) => {
           if let Some(run) = self.runs.get(run_idx) {
             let opts = CrispOpts { scale, hint: true, subpixel: true };
+            let (ox, oy) = self.run_draw_origin(run, &page, scale);
             let (ddx, ddy) = page_text_dir(page.rotate, pdf_run.dir_x, pdf_run.dir_y);
             match text_rotation_angle(ddx, ddy) {
-              None => draw_line(scene, &run.layout, run.x, run.y, opts),
+              None => draw_line(scene, &run.layout, ox, oy, opts),
               Some(angle) => {
-                let (gx, gy) = self.map_point(&page, pdf_run.x, pdf_run.y);
-                draw_rotated_line(scene, &run.layout, run.x, run.y, opts, angle, gx / scale, gy / scale)
+                let (gx, gy) = self.map_point(&page, run.ux, run.uy);
+                draw_rotated_line(scene, &run.layout, ox, oy, opts, angle, gx / scale, gy / scale)
               }
             }
           }
@@ -690,12 +693,14 @@ impl View for PdfView {
     self.page_size()
   }
 
-  fn place(&mut self, fonts: &mut FontSystem, x: f32, y: f32, w: f32, h: f32) {
-    let _ = (w, h);
-    self.ensure_layouts(fonts);
-    let (page_w, page_h) = self.page_size();
+  fn place(&mut self, fonts: &mut FontSystem, x: f32, y: f32, _w: f32, _h: f32) {
+    // Position first: every paint path (including the draw-time run
+    // origins) reads `self.x`/`self.y`, so they must be current before
+    // any layout work happens.
     self.x = x;
     self.y = y;
+    self.ensure_layouts(fonts);
+    let (page_w, page_h) = self.page_size();
     self.width = page_w;
     self.height = page_h;
   }
@@ -717,6 +722,44 @@ mod tests {
   fn doc() -> PdfDocument {
     let pdf = minimal_pdf(b"BT /F1 12 Tf 72 720 Td (Hello View) Tj ET");
     PdfDocument::load_bytes(pdf).unwrap()
+  }
+
+  #[test]
+  fn run_origins_follow_place_without_rebuild() {
+    // Regression: run draw origins were baked into the layout cache at
+    // `measure()` time (self.x/self.y were still 0), so a `place()`
+    // move left every run painted at the stale offset - all pages of a
+    // multi-page stack piled their text on one spot while paths, images
+    // and annotations (mapped at draw time) stayed correct.
+    let mut fonts = FontSystem::new();
+    let mut view = PdfView::new(doc());
+    view.measure(&mut fonts);
+    let page = view.doc.page(0).unwrap().clone();
+    let scale = fonts.scale;
+    let before = view.run_draw_origin(&view.runs[0], &page, scale);
+    view.place(&mut fonts, 130.0, 417.0, 0.0, 0.0);
+    let after = view.run_draw_origin(&view.runs[0], &page, scale);
+    // A pure move: the offset shifts by exactly (dx, dy), nothing else.
+    assert!((after.0 - before.0 - 130.0).abs() < 1e-3, "{} -> {}", before.0, after.0);
+    assert!((after.1 - before.1 - 417.0).abs() < 1e-3, "{} -> {}", before.1, after.1);
+  }
+
+  #[test]
+  fn stacked_pages_get_distinct_run_origins() {
+    // Two views over the same document, stacked like the viewer
+    // example: their single runs must land on different baselines.
+    let mut fonts = FontSystem::new();
+    let mut top = PdfView::new(doc());
+    let mut bottom = PdfView::new(doc());
+    top.measure(&mut fonts);
+    bottom.measure(&mut fonts);
+    top.place(&mut fonts, 0.0, 16.0, 0.0, 0.0);
+    bottom.place(&mut fonts, 0.0, 16.0 + 792.0 + 24.0, 0.0, 0.0);
+    let page = top.doc.page(0).unwrap().clone();
+    let scale = fonts.scale;
+    let a = top.run_draw_origin(&top.runs[0], &page, scale);
+    let b = bottom.run_draw_origin(&bottom.runs[0], &page, scale);
+    assert!((b.1 - a.1 - 816.0).abs() < 1e-3, "{} vs {}", a.1, b.1);
   }
 
   #[test]
