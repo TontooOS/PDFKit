@@ -82,6 +82,11 @@ pub struct FileParser {
   objstm_cache: RefCell<HashMap<u32, Vec<(u32, PdfValue)>>>,
   trailer: PdfValue,
   crypt: Option<CryptState>,
+  /// Offset of the last cross-reference section, kept so an
+  /// incremental update can chain `/Prev` to it.
+  startxref: u64,
+  /// True when that section is an xref stream rather than a table.
+  xref_is_stream: bool,
 }
 
 impl FileParser {
@@ -107,6 +112,8 @@ impl FileParser {
       objstm_cache: RefCell::new(HashMap::new()),
       trailer: PdfValue::Null,
       crypt: None,
+      startxref: 0,
+      xref_is_stream: false,
     };
     parser.read_xref()?;
     if parser.offsets.is_empty() && parser.compressed.is_empty() {
@@ -189,13 +196,56 @@ impl FileParser {
       Some(offset) => offset,
       None => return Ok(()),
     };
+    // Remember the section flavor and offset: an incremental update
+    // appends a section of the same kind and chains `/Prev` to it.
+    self.startxref = offset as u64;
     let pos = self.skip_ws_at(offset);
     if self.data[pos..].starts_with(b"xref") {
+      self.xref_is_stream = false;
       self.parse_table_at(pos + 4)?;
     } else {
+      self.xref_is_stream = true;
       self.parse_xref_stream_at(pos)?;
     }
     Ok(())
+  }
+
+  /// Raw file bytes.
+  pub fn raw(&self) -> &[u8] {
+    &self.data
+  }
+
+  /// Offset of the last cross-reference section.
+  pub fn startxref(&self) -> u64 {
+    self.startxref
+  }
+
+  /// True when the last cross-reference section is a stream.
+  pub fn xref_is_stream(&self) -> bool {
+    self.xref_is_stream
+  }
+
+  /// Merged trailer dictionary of the newest section.
+  pub fn trailer_value(&self) -> Option<&PdfValue> {
+    match &self.trailer {
+      PdfValue::Null => None,
+      other => Some(other),
+    }
+  }
+
+  /// One past the highest object number the file knows about.
+  ///
+  /// Taken from the trailer `/Size` when present, because that is what
+  /// defines the next free number; the xref contents are only a
+  /// fallback for damaged files.
+  pub fn next_object_number(&self) -> u32 {
+    let from_size = match self.trailer.get("Size") {
+      Some(PdfValue::Number(n)) => *n as u32,
+      _ => 0,
+    };
+    let highest = self.offsets.keys().copied().max().unwrap_or(0);
+    let compressed = self.compressed.keys().copied().max().unwrap_or(0);
+    from_size.max(highest + 1).max(compressed + 1)
   }
 
   /// Parse one classic xref table. Follows `trailer /Prev` so older
@@ -205,6 +255,14 @@ impl FileParser {
     let mut trailer = PdfValue::Null;
     loop {
       pos = self.skip_ws_at(pos);
+      // `pos` may point at the `xref` keyword itself: `read_xref`
+      // skips it, but a `/Prev` offset from a later section points
+      // straight at the keyword. Skipping it leaves the newline in
+      // front of the subsection header, so whitespace has to go again -
+      // otherwise the header reads as empty and the table is dropped.
+      if self.data[pos..].starts_with(b"xref") {
+        pos = self.skip_ws_at(pos + 4);
+      }
       if self.data[pos..].starts_with(b"trailer") {
         pos += 7;
         let mut p = ObjectParser::new(&self.data[pos..]);
@@ -233,6 +291,13 @@ impl FileParser {
         pos = end;
         let mut fields = line.split_whitespace();
         let off: usize = fields.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+        // A 20-byte entry is "offset generation type": the type is the
+        // third field. Comparing the *generation* to "n" made every
+        // entry look free, so classic xref tables contributed nothing
+        // and the whole file was recovered by scanning instead - which
+        // then kept the first copy of every object and silently
+        // ignored incremental updates.
+        let _generation = fields.next();
         let in_use = fields.next().unwrap_or("f") == "n";
         if in_use {
           if let Ok(num_u) = u32::try_from(num) {

@@ -6,6 +6,17 @@ use crate::objects::PdfValue;
 /// prefixes end here instead of in the OOM killer.
 pub const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
 
+/// Compress bytes as a zlib stream for `/Filter /FlateDecode`.
+///
+/// Used by the incremental update writer, which is the only place that
+/// emits new stream data: parsing never needs an encoder.
+pub fn deflate(data: &[u8]) -> Vec<u8> {
+  use std::io::Write as _;
+  let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+  encoder.write_all(data).expect("writing to a Vec cannot fail");
+  encoder.finish().expect("ZlibEncoder::finish cannot fail for in-memory output")
+}
+
 /// Decode a stream body honoring `/Filter` and `/DecodeParms`.
 ///
 /// Supported in v0.1: `FlateDecode` (with PNG/TIFF predictors),

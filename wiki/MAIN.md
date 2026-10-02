@@ -17,6 +17,8 @@ annotations) into a vector/text page model and renders it as a TontooUI
 | Rules | [RULE.md](RULE.md) | Development and usage rules |
 | PdfDocument | [PdfDocument.md](PdfDocument.md) | Loading, pages, encryption, outlines, metadata |
 | PdfView | [PdfView.md](PdfView.md) | TontooUI view with page, zoom and annotations |
+| PdfEditor | [PdfEditor.md](PdfEditor.md) | Rewriting text runs and saving in place |
+| IncrementalUpdate | [IncrementalUpdate.md](IncrementalUpdate.md) | Appending edited objects to an existing file |
 | DocumentStructure | [DocumentStructure.md](DocumentStructure.md) | Header, xref, object streams, filters |
 | Graphics | [Graphics.md](Graphics.md) | Paths, colors, transparency, patterns, shadings |
 | Fonts | [Fonts.md](Fonts.md) | Encodings, ToUnicode CMaps, CID fonts |
@@ -45,6 +47,18 @@ See [PdfDocument.md](PdfDocument.md) for details.
 
 ## Changelog
 
+- 2026-10-02: Real text editing. `PdfEditor` splices new bytes at a
+  run's `OpSpan`, re-encodes only the changed content streams and saves
+  as an incremental update (`UpdateWriter`); `Document::open` and
+  `PdfEditor::save_to` match the API the Preview app already expected.
+  Encrypted files are refused with `EncryptedEdit`. New `editdemo`
+  example; poppler reads and renders the result.
+- 2026-10-02: Fixed two classic-xref-table bugs that had been masked by
+  the object-scan fallback. Entry type was read from the generation
+  field, so no table entry was ever marked in use, and the `xref`
+  keyword was not skipped when following `/Prev`. Every table-based file
+  was being recovered by scanning, which kept the *first* copy of each
+  object and silently ignored incremental updates.
 - 2026-10-02: Editor foundation. Content tokens carry byte ranges end
   to end: `OpSpan` on text runs (pointing at their own string, never
   the `TJ` array), paths and images (pointing at the active `cm`);

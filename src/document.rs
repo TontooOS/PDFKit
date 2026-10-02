@@ -12,6 +12,7 @@ use crate::image::{apply_alpha, apply_constant_alpha, decode_jpeg, decode_mask_a
 use crate::objects::PdfValue;
 use crate::page::PdfPage;
 use crate::parser::{ContentSegment, FileParser};
+use crate::writer::Trailer;
 
 /// A loaded PDF document: parsed structure plus interpreted pages.
 ///
@@ -23,12 +24,31 @@ pub struct PdfDocument {
   pages: Vec<PdfPage>,
   outlines: Vec<Outline>,
   info: DocInfo,
+  /// Original file bytes, kept verbatim so the editor can append an
+  /// incremental update instead of rewriting the whole file.
+  data: Vec<u8>,
+  /// What the writer needs to append a valid cross-reference section.
+  trailer: Trailer,
+  /// `startxref` of the last section in `data`.
+  startxref: u64,
+  /// True when that section is an xref stream, not a table.
+  xref_is_stream: bool,
+  /// Highest object number seen, so new objects get fresh numbers.
+  next_num: u32,
 }
 
 impl PdfDocument {
   /// Parse a document from memory.
   pub fn load_bytes(data: Vec<u8>) -> Result<Self> {
     Self::load_bytes_with_password(data, "")
+  }
+
+  /// Open a document for editing, keyed on the path only.
+  ///
+  /// Thin alias so apps can call `Document::open(path)` and then
+  /// `PdfEditor::new(doc)`; `load_file` is the same thing.
+  pub fn open(path: &str) -> Result<Self> {
+    Self::load_file(path)
   }
 
   /// Parse a document from memory with a password (may be empty).
@@ -79,6 +99,7 @@ impl PdfDocument {
         .collect();
       pages.push(PdfPage {
         number: item.index,
+        object_number: item.objnum,
         width,
         height,
         origin_x: item.media_box[0],
@@ -115,7 +136,59 @@ impl PdfDocument {
       .map(|o| resolve_outline(parser, &names, &page_of, o))
       .collect();
     let info = parser.info_dict().and_then(|d| parser.resolve_value(&d).ok()).map(|d| parse_info(&d)).unwrap_or_default();
-    Ok(Self { pages, outlines, info })
+    // Keep what an incremental update needs: the bytes, the trailer
+    // entries to carry forward, and whether the last section is an
+    // xref stream (mirroring it keeps readers happy).
+    let trailer_value = parser.trailer_value().cloned().unwrap_or(PdfValue::Null);
+    let as_ref = |key: &str| match trailer_value.get(key) {
+      Some(PdfValue::Ref(n, g)) => Some((*n, *g)),
+      _ => None,
+    };
+    let id = match trailer_value.get("ID").and_then(|v| v.as_array()) {
+      Some(items) => items.first().and_then(|v| match v {
+        PdfValue::Str(bytes) | PdfValue::Hex(bytes) => Some(bytes.clone()),
+        _ => None,
+      }),
+      None => None,
+    };
+    let size = match trailer_value.get("Size") {
+      Some(PdfValue::Number(n)) => *n as u32,
+      _ => 0,
+    };
+    let startxref = parser.startxref();
+    let xref_is_stream = parser.xref_is_stream();
+    let trailer = Trailer { root: as_ref("Root"), info: as_ref("Info"), encrypt: as_ref("Encrypt"), id, size };
+    Ok(Self { pages, outlines, info, data: parser.raw().to_vec(), trailer, startxref, xref_is_stream, next_num: parser.next_object_number() })
+  }
+
+  /// Original file bytes as loaded.
+  pub fn bytes(&self) -> &[u8] {
+    &self.data
+  }
+
+  /// Trailer entries an incremental update must carry forward.
+  pub(crate) fn trailer(&self) -> &Trailer {
+    &self.trailer
+  }
+
+  /// `startxref` offset of the last cross-reference section.
+  pub(crate) fn startxref(&self) -> u64 {
+    self.startxref
+  }
+
+  /// True when the last cross-reference section is a stream.
+  pub(crate) fn xref_is_stream(&self) -> bool {
+    self.xref_is_stream
+  }
+
+  /// One past the highest object number in the file.
+  pub(crate) fn next_object_number(&self) -> u32 {
+    self.next_num
+  }
+
+  /// True when the file is encrypted, which the editor refuses.
+  pub fn is_encrypted(&self) -> bool {
+    self.trailer.encrypt.is_some()
   }
 
   /// Number of pages in the document.

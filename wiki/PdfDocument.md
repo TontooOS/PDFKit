@@ -82,6 +82,9 @@ Reads the file at `path` and parses it with a password.
 | `is_empty_text` | `is_empty_text(&self) -> bool` | True when no page carries text runs |
 | `outlines` | `outlines(&self) -> &[Outline]` | Bookmarks with resolved page targets |
 | `info` | `info(&self) -> &DocInfo` | Metadata from the trailer `/Info` dict |
+| `bytes` | `bytes(&self) -> &[u8]` | The file as loaded, for the editor to append to |
+| `is_encrypted` | `is_encrypted(&self) -> bool` | True when the trailer carries `/Encrypt` |
+| `open` | `open(path: &str) -> Result<Self>` | Alias for `load_file`, so apps can write `Document::open` |
 | `text` | `text(&self) -> String` (`PdfPage`) | Plain text, runs ordered top-to-bottom |
 
 ## Errors
@@ -101,6 +104,11 @@ Reads the file at `path` and parses it with a password.
 | `NeedsPassword` | Encrypted file, empty password rejected |
 | `WrongPassword` | Explicit password rejected |
 | `UnsupportedCrypt(msg)` | Unknown `V`/`R` or handler |
+| `EncryptedEdit` | Editing an encrypted file would need re-encryption |
+| `NoSuchRun(i)` | No text run `i` on that page |
+| `UneditableRun(i)` | Run `i` has no addressable source bytes |
+| `RunNotFound(text)` | `replace_text` matched no run |
+| `OverlappingEdit` | Two edits overlap in one content stream |
 | `Lang(msg)` | Language file is not valid JSON |
 
 ## Usage / Example
@@ -120,6 +128,7 @@ println!("{}", first.text());
 ## Cross References
 
 - [PdfView.md](PdfView.md) – renders these pages as a TontooUI view
+- [PdfEditor.md](PdfEditor.md) – changing these pages and saving
 - [DocumentStructure.md](DocumentStructure.md) – file layout and encryption
 - [Annotations.md](Annotations.md) – outlines, links and metadata
 - [Language.md](Language.md) – user-facing error strings

@@ -34,6 +34,18 @@ pub enum PdfError {
   WrongPassword,
   /// Unsupported crypt filter or handler; carries a detail message.
   UnsupportedCrypt(String),
+  /// The file is encrypted; editing would have to re-encrypt appended
+  /// bytes, which is not implemented.
+  EncryptedEdit,
+  /// No text run with that index on the requested page.
+  NoSuchRun(usize),
+  /// The run exists but its source bytes are not addressable, so it
+  /// cannot be rewritten (inline-image data, synthesized strings).
+  UneditableRun(usize),
+  /// Two edits overlap in the same content stream.
+  OverlappingEdit,
+  /// No run on the page carries the searched-for text.
+  RunNotFound(String),
 }
 
 impl fmt::Display for PdfError {
@@ -53,6 +65,11 @@ impl fmt::Display for PdfError {
       Self::NeedsPassword => write!(f, "file is encrypted, password required"),
       Self::WrongPassword => write!(f, "wrong password"),
       Self::UnsupportedCrypt(detail) => write!(f, "unsupported encryption: {detail}"),
+      Self::EncryptedEdit => write!(f, "editing encrypted files is not supported"),
+      Self::NoSuchRun(i) => write!(f, "no text run with index {i}"),
+      Self::UneditableRun(i) => write!(f, "text run {i} has no addressable source bytes"),
+      Self::OverlappingEdit => write!(f, "edits overlap in the same content stream"),
+      Self::RunNotFound(text) => write!(f, "no run with text {text:?}"),
     }
   }
 }

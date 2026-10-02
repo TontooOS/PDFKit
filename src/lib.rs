@@ -22,6 +22,7 @@ pub mod cmyk_lut;
 pub mod crypt;
 pub mod document;
 pub mod color;
+pub mod editor;
 pub mod error;
 pub mod filter;
 pub mod font;
@@ -32,11 +33,15 @@ pub mod objects;
 pub mod page;
 pub mod parser;
 pub mod view;
+pub mod writer;
 
 pub use color::{Function, ResolvedPattern, ResolvedShading, calgray_to_rgb, calrgb_to_rgb, indexed_lookup, lab_to_rgb, parse_function, parse_sampled, shading_stops};
 pub use annot::{Annotation, DocInfo, LinkTarget, Outline, parse_annotation, parse_info, parse_outlines, pdfdoc_to_string};
 pub use crypt::{Cfm, CryptState, PADDING, aes128_cbc_decrypt, aes128_cbc_encrypt, aes256_cbc_decrypt, md5sum, pdf20_hash, rc4, sha256sum};
 pub use document::PdfDocument;
+/// Alias so apps can call `Document::open(path)` before editing.
+pub use document::PdfDocument as Document;
+pub use editor::PdfEditor;
 pub use font::{CMap, DecoderKind, FontDecoder, RangeDst, apply_differences, glyph_name_to_char, parse_cmap};
 pub use error::{PdfError, Result};
 pub use graphics::{
@@ -48,3 +53,4 @@ pub use image::{DecodedImage, apply_alpha, apply_constant_alpha, decode_jpeg, de
 pub use page::{OpSpan, PdfPage, PdfTextRun, decode_text};
 pub use parser::{ContentSegment, FileParser, PageFont, ParsedPage};
 pub use view::{PdfView, PDF_BG_DARK, PDF_BG_LIGHT, PDF_PAPER, PDF_TEXT_DARK, PDF_TEXT_LIGHT};
+pub use writer::{Trailer, UpdateWriter};

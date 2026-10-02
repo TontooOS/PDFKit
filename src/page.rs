@@ -84,6 +84,9 @@ pub struct PdfTextRun {
 pub struct PdfPage {
   /// Zero-based page index in document order.
   pub number: usize,
+  /// Object number of the page dict. An editor re-emits this object
+  /// with a new `/Contents` when it changes a content stream.
+  pub object_number: u32,
   /// Page width in points.
   pub width: f32,
   /// Page height in points.
@@ -140,6 +143,8 @@ impl PdfPage {
     let runs = text_runs(&items);
     Ok(Self {
       number,
+      // Standalone interpretation has no page dict object behind it.
+      object_number: 0,
       width,
       height,
       origin_x: media_box[0],

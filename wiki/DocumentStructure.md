@@ -19,6 +19,13 @@ Files must start with `%PDF-`. When no usable xref data exists, every
 | Trailer merge | `/Root`, `/Info`, `/Encrypt`, `/ID`, `/Size` from newest |
 | Object streams | `/Type /ObjStm` unpacked with an index cache |
 
+A 20-byte table entry is `offset generation type`; the type is the third
+field, and only `n` marks the object as in use. The scan fallback (used
+when no xref data is usable) recovers a file by taking the *first* copy
+of every object, so it ignores later definitions - that is what made
+incremental updates invisible before
+[IncrementalUpdate.md](IncrementalUpdate.md) existed.
+
 ## Filters
 
 | Filter | Status |
@@ -112,3 +119,4 @@ empty passwords).
 
 - [PdfDocument.md](PdfDocument.md) – loading API and error variants
 - [Images.md](Images.md) – how image streams reuse these filters
+- [IncrementalUpdate.md](IncrementalUpdate.md) – writing new xref sections
