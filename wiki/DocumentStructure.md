@@ -40,6 +40,11 @@ incremental updates invisible before
 
 Multi-filter chains and `/DecodeParms` arrays decode in order.
 
+`FlateDecode` is handled by `archivekit::zlib_decompress_unverified_limited`
+with a size cap. The Adler-32 trailer is **not** checked: many PDF producers
+ship a zeroed or stale one, and the previous `flate2`-based decoder ignored it
+too, so this keeps the same files readable.
+
 ## Encryption
 
 `FileParser::new` opens with the empty password;

@@ -882,9 +882,7 @@ pub(crate) mod tests {
 
   #[test]
   fn decodes_flate_stream() {
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET").unwrap();
-    let compressed = enc.finish().unwrap();
+let compressed = crate::filter::deflate(b"BT /F1 12 Tf 72 720 Td (Hi) Tj ET");
     let pdf = minimal_pdf(&[]);
     let _ = pdf;
     let inner: Vec<u8> = [
@@ -901,11 +899,9 @@ pub(crate) mod tests {
     assert!(pages[0].content.windows(2).any(|w| w == b"Hi"));
   }
 
-  fn flate(raw: &[u8]) -> Vec<u8> {
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(raw).unwrap();
-    enc.finish().unwrap()
-  }
+fn flate(raw: &[u8]) -> Vec<u8> {
+    crate::filter::deflate(raw)
+}
 
   /// Build a fully compressed PDF: xref stream plus the font packed
   /// in an object stream. No classic xref table at all.

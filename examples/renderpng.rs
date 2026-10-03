@@ -194,7 +194,7 @@ impl Gpu {
   }
 }
 
-/// Lossless RGBA8 PNG writer (filter 0, zlib via flate2).
+/// Lossless RGBA8 PNG writer (filter 0, zlib via ArchiveKit).
 /// Local to this example so page renders never depend on the
 /// CoreImage PNG encoder; reading still goes through CoreImage.
 fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
@@ -210,10 +210,7 @@ fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
     raw.push(0);
     raw.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
   }
-  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  use std::io::Write as _;
-  enc.write_all(&raw).map_err(|e| e.to_string())?;
-  let compressed = enc.finish().map_err(|e| e.to_string())?;
+  let compressed = archivekit::zlib_compress(&raw, archivekit::CompressionLevel::Balanced);
   let mut out = Vec::with_capacity(compressed.len() + 128);
   out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
   let mut ihdr = Vec::with_capacity(13);

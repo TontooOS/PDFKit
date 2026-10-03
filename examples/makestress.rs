@@ -1,4 +1,3 @@
-use std::io::Write as IoWrite;
 
 /// Stress PDF generator for side-by-side comparison (e.g. Firefox).
 ///
@@ -101,9 +100,7 @@ impl Builder {
 }
 
 fn flate(raw: &[u8]) -> Vec<u8> {
-  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  enc.write_all(raw).unwrap();
-  enc.finish().unwrap()
+  archivekit::zlib_compress(raw, archivekit::CompressionLevel::Balanced)
 }
 
 fn ascii85(raw: &[u8]) -> Vec<u8> {

@@ -25,8 +25,10 @@ everything else to `en_us`).
 pub fn validate() -> Result<()>
 ```
 
-Parses both language files. Returns `Err(Lang)` with a detail message
-when a file is not valid JSON.
+Parses both language files with `foundation::serialization::JsonValue`.
+Returns `Err(Lang)` with a detail message when a file is not valid JSON or
+its root is not an object. Entries whose value is not a string are skipped
+rather than failing the whole table, so one bad key cannot empty the UI.
 
 ## Keys
 

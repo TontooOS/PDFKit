@@ -11,10 +11,7 @@ pub const MAX_STREAM_BYTES: usize = 512 * 1024 * 1024;
 /// Used by the incremental update writer, which is the only place that
 /// emits new stream data: parsing never needs an encoder.
 pub fn deflate(data: &[u8]) -> Vec<u8> {
-  use std::io::Write as _;
-  let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  encoder.write_all(data).expect("writing to a Vec cannot fail");
-  encoder.finish().expect("ZlibEncoder::finish cannot fail for in-memory output")
+  archivekit::zlib_compress(data, archivekit::CompressionLevel::Balanced)
 }
 
 /// Decode a stream body honoring `/Filter` and `/DecodeParms`.
@@ -91,15 +88,10 @@ fn parms_list(dict: &PdfValue, count: usize) -> Result<Vec<PdfValue>> {
 }
 
 fn inflate(raw: &[u8]) -> Result<Vec<u8>> {
-  use std::io::Read;
-  let decoder = flate2::read::ZlibDecoder::new(raw);
-  let mut limited = decoder.take(MAX_STREAM_BYTES as u64 + 1);
-  let mut out = Vec::new();
-  limited.read_to_end(&mut out).map_err(|e| PdfError::StreamDecode(e.to_string()))?;
-  if out.len() > MAX_STREAM_BYTES {
-    return Err(PdfError::StreamDecode("stream exceeds size cap".into()));
-  }
-  Ok(out)
+  // Unverified on purpose: many PDF producers ship a stale or zeroed Adler-32
+  // trailer, so rejecting on the checksum would lock out valid documents.
+  archivekit::zlib_decompress_unverified_limited(raw, MAX_STREAM_BYTES)
+    .map_err(|e| PdfError::StreamDecode(e.to_string()))
 }
 
 /// Apply a predictor from `/DecodeParms` (`/Predictor 1` means none).
@@ -420,9 +412,7 @@ mod tests {
 
   #[test]
   fn flate_with_chain() {
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(b"chain").unwrap();
-    let compressed = enc.finish().unwrap();
+    let compressed = deflate(b"chain");
     let dict = PdfValue::Dict(vec![(
       "Filter".into(),
       PdfValue::Array(vec![

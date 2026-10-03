@@ -13,10 +13,9 @@ keywords = ["tontoo", "pdf", "viewer", "vello"]
 categories = ["gui", "parser-implementations"]
 
 [dependencies]
-flate2 = "1"
 parley = "0.11"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+archivekit = { package = "archivekit", path = "../ArchiveKit" }
+foundation = { package = "foundation", path = "../Foundation" }
 coreimage = { package = "coreimage", path = "../CoreImage" }
 md5 = "0.7"
 sha2 = "0.10"

@@ -47,6 +47,7 @@ See [PdfDocument.md](PdfDocument.md) for details.
 
 ## Changelog
 
+- 2026-10-02: Dependency cleanup. `flate2`, `serde` and `serde_json` removed. `/FlateDecode` now goes through ArchiveKit's new `zlib` module, which wraps the hand-written DEFLATE engine instead of pulling in a C or Rust compression crate; the Adler-32 trailer stays unverified, matching the old behavior. Language files are parsed with `foundation::serialization::JsonValue`. `serde` was only a declared dependency, never used with derive. See [DocumentStructure.md](DocumentStructure.md) and [Language.md](Language.md).
 - 2026-10-02: Real text editing. `PdfEditor` splices new bytes at a
   run's `OpSpan`, re-encodes only the changed content streams and saves
   as an incremental update (`UpdateWriter`); `Document::open` and

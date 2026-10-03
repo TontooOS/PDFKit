@@ -1249,10 +1249,7 @@ mod tests {
     // E079 regression: the soft mask stream carries /Filter, and its
     // bytes must be decoded exactly once. Decoding twice drops the
     // mask so the image renders as if unmasked.
-    use std::io::Write as _;
-    let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    enc.write_all(&[0u8, 255]).unwrap();
-    let masked = enc.finish().unwrap();
+    let masked = crate::filter::deflate(&[0u8, 255]);
     let img = [255u8, 0, 0, 0, 0, 255];
     let content = b"q 2 0 0 1 10 10 cm /Im1 Do Q";
     let objects: Vec<Vec<u8>> = vec![

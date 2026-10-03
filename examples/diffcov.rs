@@ -52,7 +52,7 @@ fn main() {
     die("need --scale S with S > 0");
   }
   let manifest_text = std::fs::read_to_string(manifest_path).unwrap_or_else(|e| die(&format!("cannot read {manifest_path}: {e}")));
-  let manifest: serde_json::Value = serde_json::from_str(&manifest_text).unwrap_or_else(|e| die(&format!("bad manifest JSON: {e}")));
+  let manifest = foundation::serialization::JsonValue::parse(&manifest_text).unwrap_or_else(|e| die(&format!("bad manifest JSON: {e}")));
   let entries = manifest.as_array().unwrap_or_else(|| die("manifest must be a JSON array"));
   let mut passed = 0u32;
   let mut failed = 0u32;
@@ -332,7 +332,7 @@ fn write_strip(outdir: &str, id: &str, ref_px: &[u8], our_px: &[u8], w: u32, h: 
   }
 }
 
-/// Lossless RGBA8 PNG writer (filter 0, zlib via flate2).
+/// Lossless RGBA8 PNG writer (filter 0, zlib via ArchiveKit).
 /// Local to this example so failure strips never depend on the
 /// CoreImage PNG encoder; reading still goes through CoreImage.
 fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
@@ -348,10 +348,7 @@ fn write_png(path: &str, w: u32, h: u32, rgba: &[u8]) -> Result<(), String> {
     raw.push(0);
     raw.extend_from_slice(&rgba[y * stride..(y + 1) * stride]);
   }
-  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  use std::io::Write as _;
-  enc.write_all(&raw).map_err(|e| e.to_string())?;
-  let compressed = enc.finish().map_err(|e| e.to_string())?;
+  let compressed = archivekit::zlib_compress(&raw, archivekit::CompressionLevel::Balanced);
   let mut out = Vec::with_capacity(compressed.len() + 128);
   out.extend_from_slice(&[137, 80, 78, 71, 13, 10, 26, 10]);
   let mut ihdr = Vec::with_capacity(13);

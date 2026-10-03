@@ -67,7 +67,8 @@ pub struct Trailer {
 ```
 
 `filter::deflate` does the compression; it is the only encoder in the
-crate, used solely by this writer.
+crate, used solely by this writer. It calls
+`archivekit::zlib_compress(data, CompressionLevel::Balanced)`.
 
 ## Usage / Example
 
